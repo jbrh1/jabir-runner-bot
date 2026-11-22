@@ -1,40 +1,40 @@
-import os, threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
-
-def keep_alive():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
-threading.Thread(target=keep_alive, daemon=True).start()
-
 import os
+import re
+import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-TOKEN = os.environ.get("BOT_TOKEN")
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TOKEN:
+    TOKEN = os.environ.get("BOT_TOKEN")
+GROQ_KEY = os.environ.get("GROQ_API_KEY")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Sannu! Ni ne Jabir Runner Bot 🏃\nRubuta /help don ganin abin da zan iya yi.")
+SYSTEM_PROMPT = """
+You are the Narrative Engine of the Runners Tracker bot. You analyze DEX-traded tokens and score the strength of their narrative.
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("/start - Fara\n/help - Taimako")
+INPUT
+Contract Address (CA): [CA]
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Ka ce: {update.message.text}")
+This is the only input. Use your knowledge to find everything else yourself: token name, ticker, chain, DexScreener data, X/Twitter posts, website, Telegram, and related news. Never invent posts, metrics, news, celebrities, or partnerships. If something cannot be verified, write "Unverified" and lower confidence.
 
-def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    print("Bot is running...")
-    app.run_polling()
+STEP 1: IDENTIFY THE NARRATIVE
+Find out what the token is based on (animal, person, event, news story, culture, joke, AI, political theme, etc.). Summarize it in one sentence. If no clear narrative exists, say so and score low.
 
-if __name__ == "__main__":
-    main()
+STEP 2: SCORE EACH PILLAR (0 to 10, with one-line evidence)
+1. Meme Simplicity (weight 15)
+2. Viral Post (weight 20)
+3. Strong News (weight 20)
+4. Originality (weight 10)
+5. Momentum (weight 10)
+6. Longevity (weight 10)
+7. Community Authenticity (weight 10)
+8. Narrative-Token Connection (weight 5)
+
+STEP 3: TOTAL AND CLASSIFICATION
+Weighted total out of 10 (one decimal).
+- GREEN: 7.5 to 10
+- YELLOW: 5.0 to 7.4
+- RED: below 5.0
+
+OUTPUT FORMAT
+🧠 LORE: [Token Name] ($TICKER) | 
