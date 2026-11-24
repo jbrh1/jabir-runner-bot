@@ -2,9 +2,7 @@
 import os
 import re
 import json
-import time
 import asyncio
-import threading
 import requests
 
 from telegram import (
@@ -33,184 +31,255 @@ PORT = int(os.environ.get("PORT", 10000))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 WEBHOOK_PATH = "telegram-webhook"
 
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 # =====================================
-# BRANDING
+# BOT BRANDING
 # =====================================
 
 BOT_NAME = "JABIR RUNNER"
 BOT_TAGLINE = "See Beyond The Chart."
 
-GROQ_MODEL = "openai/gpt-oss-120b"
-
-DEX_CACHE_TTL = 60
-DEX_MAX_RETRIES = 2
-
-DEX_CACHE = {}
-DEX_LOCK = threading.Lock()
-
-
 # =====================================
-# NARRATIVE WEIGHTS
+# SCORING WEIGHTS
 # =====================================
 
-WEIGHTS = {
-    "meme_simplicity": 15,
-    "viral_post_evidence": 20,
-    "strong_news": 20,
-    "originality": 10,
-    "momentum": 10,
-    "longevity": 10,
-    "community_authenticity": 10,
-    "narrative_connection": 5,
+PILLARS = {
+    "Meme Simplicity": 15,
+    "Viral Post Evidence": 20,
+    "Strong News Evidence": 20,
+    "Originality": 10,
+    "Momentum": 10,
+    "Longevity": 10,
+    "Community Authenticity": 10,
+    "Narrative-Token Connection": 5,
 }
-
-PILLAR_LABELS = {
-    "meme_simplicity": "Meme Simplicity",
-    "viral_post_evidence": "Viral Post Evidence",
-    "strong_news": "Strong News",
-    "originality": "Originality",
-    "momentum": "Momentum",
-    "longevity": "Longevity",
-    "community_authenticity": "Community Authenticity",
-    "narrative_connection": "Narrative-Token Connection",
-}
-
 
 # =====================================
 # GROQ SYSTEM PROMPT
 # =====================================
 
 SYSTEM_PROMPT = """
-You are the evidence-based Narrative Intelligence Engine
-of JABIR RUNNER.
+You are JABIR RUNNER, a careful Solana token narrative analyst.
 
-Analyze the supplied DexScreener token data.
+Your job is to analyze token narratives using the supplied
+DexScreener market data.
 
-STRICT EVIDENCE RULES:
+IMPORTANT SOURCE LIMITATION:
 
-1. Use ONLY the supplied DexScreener information.
-2. Never claim to have searched social media, news,
-   websites, Telegram or other sources.
-3. Never invent partnerships, viral posts, holders,
-   audits, developer information or announcements.
-4. Trading volume is NOT proof of community interest.
-5. Volume/liquidity ratio is NOT proof of bullish momentum.
-6. Missing evidence must be clearly identified.
-7. Do not confuse missing data with proof of failure.
-8. Do not claim a token is safe.
-9. Be conservative with scores.
-10. Narrative lifespan is uncertain without historical
-    and external evidence. Never predict an exact lifespan.
+The only factual source supplied to you is DexScreener data.
+You have NOT searched X, Telegram, websites, news, exchanges,
+holder analytics, blockchain explorers or project documents.
 
-SCORING:
+Never pretend that you searched those sources.
 
-Score each pillar from 0 to 10.
+Never invent:
+- Social media posts or follower counts.
+- Partnerships or exchange listings.
+- Physical products or brand achievements.
+- Community size or authenticity.
+- Developer activity or holder distribution.
+- Audits or contract safety.
+- Historical performance not supplied in the data.
 
-meme_simplicity:
-A clear and understandable meme concept.
+A token name alone is not proof of a real-world brand,
+community, cultural influence or established narrative.
 
-viral_post_evidence:
-Actual viral social-media evidence.
-If unavailable, score 0.
+If a real-world brand connection is not supported by
+the supplied evidence, describe it as unverified.
 
-strong_news:
-Verified news or partnerships.
-If unavailable, score 0.
+EVIDENCE TYPES:
 
-originality:
-Distinctiveness of the concept.
+Every pillar must have one of these evidence types:
 
-momentum:
-Only observable market activity. Do not treat volume
-alone as proof of positive momentum.
+1. Verified:
+   Directly supported by supplied DexScreener data.
 
-longevity:
-Evidence of lasting relevance. Missing history means
-low confidence and a conservative score.
+2. AI Interpretation:
+   A cautious interpretation of supplied information.
+   It is not an independently verified fact.
 
-community_authenticity:
-Verified community evidence. DexScreener alone cannot
-establish community authenticity.
+3. Missing:
+   No meaningful evidence is available.
 
-narrative_connection:
-How clearly the token identity matches its narrative.
+CRITICAL SCORING RULE:
+
+If evidence is Missing, set that pillar's score to null.
+Do NOT give it 0/10.
+
+A missing pillar is excluded from the weighted score.
+Do not punish a token for data DexScreener does not provide.
+
+Only score a pillar when there is meaningful evidence.
+
+SCORING PILLARS:
+
+1. Meme Simplicity: 15%
+2. Viral Post Evidence: 20%
+3. Strong News Evidence: 20%
+4. Originality: 10%
+5. Momentum: 10%
+6. Longevity: 10%
+7. Community Authenticity: 10%
+8. Narrative-Token Connection: 5%
+
+MOMENTUM RULES:
+
+Use the supplied market data carefully.
+
+Volume and liquidity are denominated in USD.
+Never label them as SOL.
+
+Trading volume is not proof of community authenticity.
+Buys exceeding sells do not prove organic demand.
+Price increase is not proof of a news catalyst.
+High volume is not automatically bullish.
+
+You may score Momentum using price change, volume,
+liquidity and buy/sell activity, but explain the limitations.
+
+NARRATIVE INTELLIGENCE:
+
+Explain the possible narrative, audience and cultural meaning
+only when supported by evidence.
+
+If the data only gives a token name and ticker,
+do not invent a detailed brand story.
+
+If external brand information is unavailable,
+say that the real-world narrative requires verification.
+
+CATALYSTS:
+
+Only list verified catalysts if actual evidence exists.
+
+A price increase, trading volume or buy/sell activity
+is market activity, NOT a verified news catalyst.
+
+CLASSIFICATION:
+
+Do not calculate the final weighted score yourself.
+Python will calculate it.
+
+List verified negative evidence separately.
+Only include negative evidence that is directly supported
+by the supplied data.
+
+Do not label missing data as negative evidence.
+
+RISKS:
+
+List meaningful risks supported by the available data.
+Clearly distinguish verified risks from unverified concerns.
+
+NARRATIVE LIFESPAN:
+
+Use "Uncertain" when there is insufficient historical evidence.
+Do not predict lifespan confidently from 24-hour data.
+
+HUMOR:
+
+Include one short, clean Hausa joke related to charts,
+trading or research.
+
+Keep it friendly and harmless.
+Do not joke about financial losses or encourage trading.
+
+LANGUAGE:
+
+Write the analysis in natural Hausa.
+Keep technical terms understandable.
 
 OUTPUT:
 
-Return ONLY valid JSON. No markdown or code fences.
+Return ONLY valid JSON. Do not use Markdown fences.
 
-Use exactly these keys:
+Use exactly this structure:
 
 {
-  "narrative": "One sentence",
-  "catalysts": [],
+  "narrative": "Hausa narrative explanation",
+  "audience": "Known audience or Unverified",
+  "cultural_relevance": "Supported explanation or Unverified",
+  "brand_connection": "Supported explanation or Unverified",
+  "catalysts": [
+    {
+      "item": "Catalyst",
+      "evidence": "Evidence",
+      "type": "Verified"
+    }
+  ],
   "scores": {
-    "meme_simplicity": {
+    "Meme Simplicity": {
       "score": 0,
       "evidence": "Explanation",
-      "evidence_type": "Verified/Missing/AI Interpretation"
+      "type": "AI Interpretation"
     },
-    "viral_post_evidence": {
-      "score": 0,
-      "evidence": "Explanation",
-      "evidence_type": "Verified/Missing/AI Interpretation"
+    "Viral Post Evidence": {
+      "score": null,
+      "evidence": "No social data supplied",
+      "type": "Missing"
     },
-    "strong_news": {
-      "score": 0,
-      "evidence": "Explanation",
-      "evidence_type": "Verified/Missing/AI Interpretation"
+    "Strong News Evidence": {
+      "score": null,
+      "evidence": "No news data supplied",
+      "type": "Missing"
     },
-    "originality": {
-      "score": 0,
+    "Originality": {
+      "score": null,
       "evidence": "Explanation",
-      "evidence_type": "Verified/Missing/AI Interpretation"
+      "type": "Missing"
     },
-    "momentum": {
+    "Momentum": {
       "score": 0,
-      "evidence": "Explanation",
-      "evidence_type": "Verified/Missing/AI Interpretation"
+      "evidence": "Market data explanation",
+      "type": "Verified"
     },
-    "longevity": {
-      "score": 0,
-      "evidence": "Explanation",
-      "evidence_type": "Verified/Missing/AI Interpretation"
+    "Longevity": {
+      "score": null,
+      "evidence": "No historical data supplied",
+      "type": "Missing"
     },
-    "community_authenticity": {
-      "score": 0,
-      "evidence": "Explanation",
-      "evidence_type": "Verified/Missing/AI Interpretation"
+    "Community Authenticity": {
+      "score": null,
+      "evidence": "No community data supplied",
+      "type": "Missing"
     },
-    "narrative_connection": {
-      "score": 0,
+    "Narrative-Token Connection": {
+      "score": null,
       "evidence": "Explanation",
-      "evidence_type": "Verified/Missing/AI Interpretation"
+      "type": "Missing"
     }
   },
+  "verified_negative_evidence": [],
+  "risks": [
+    {
+      "item": "Risk",
+      "type": "Verified"
+    }
+  ],
+  "unverified_items": [
+    "Social media activity",
+    "Community authenticity",
+    "Holder distribution",
+    "Developer wallets",
+    "Contract security"
+  ],
   "lifespan": {
     "estimate": "Uncertain",
     "reason": "Explanation"
   },
-  "risks": [
-    "Risk 1",
-    "Risk 2",
-    "Risk 3"
-  ],
-  "unverified": [],
-  "confidence": "Low"
+  "humor": "One short Hausa joke",
+  "limitations": "Explain what this analysis cannot verify"
 }
 
 IMPORTANT:
-
-- Score must be a number between 0 and 10.
-- Do not calculate total score. Python calculates it.
-- Use Hausa for explanations.
-- Keep evidence concise and factual.
-- Use only the supplied data.
-- If a field is unsupported, say it is missing.
-- Confidence must be High, Medium or Low.
-- Lifespan estimate should be Hours, Days, Weeks,
-  Long-term or Uncertain.
+- Replace example scores with your actual assessment.
+- Use null for missing scores.
+- Scores must be between 0 and 10.
+- Never use 0 just because evidence is missing.
+- If a pillar has no meaningful evidence, use null and Missing.
+- Never invent a catalyst.
+- Never claim a project is safe.
 """
 
 
@@ -241,60 +310,57 @@ def back_keyboard():
 
 
 # =====================================
-# MESSAGES
+# MESSAGE TEMPLATES
 # =====================================
 
 def welcome_message():
     return (
-        "🚀 JABIR RUNNER\n"
-        "See Beyond The Chart.\n\n"
-        "🔍 SOLANA TOKEN NARRATIVE INTELLIGENCE\n\n"
+        "🚀 <b>JABIR RUNNER</b>\n"
+        "<i>See Beyond The Chart.</i>\n\n"
+        "🔍 <b>Solana Token Narrative Intelligence</b>\n\n"
         "Barka da zuwa Jabir Runner!\n"
-        "Ina taimaka maka wajen binciken narrative "
-        "da market data na token.\n\n"
-        "📊 FEATURES\n"
-        "• Narrative Analysis\n"
-        "• Weighted Scoring\n"
-        "• Market Data\n"
-        "• Evidence Assessment\n"
-        "• Risk Awareness\n\n"
-        "👇 Turo min Solana Contract Address (CA).\n\n"
-        "⚠️ Narrative score ba ya tabbatar da tsaron token."
+        "Ni ne mataimakinka wajen binciken "
+        "narrative da bayanan token.\n\n"
+        "📊 <b>Abin da zan iya yi:</b>\n"
+        "• Token Narrative Analysis\n"
+        "• Evidence-Based Scoring\n"
+        "• Market Data from DexScreener\n"
+        "• Risk Awareness\n"
+        "• Narrative Intelligence\n\n"
+        "👇 <b>Yadda za ka fara:</b>\n"
+        "Turo min Contract Address (CA).\n\n"
+        "⚠️ <i>Narrative score ba ya tabbatar da "
+        "cewa token yana da aminci.</i>"
     )
 
 
 def help_message():
     return (
-        "📖 JABIR RUNNER GUIDE\n\n"
-        "YADDA AKE AMFANI:\n\n"
-        "1. Ka samo Contract Address.\n"
-        "2. Ka turo CA ɗin nan.\n"
+        "📖 <b>JABIR RUNNER GUIDE</b>\n\n"
+        "Yadda nake aiki:\n\n"
+        "1. Ka samo Contract Address (CA).\n"
+        "2. Ka turo min CA ɗin.\n"
         "3. Zan ɗauko bayanai daga DexScreener.\n"
-        "4. Groq zai tantance narrative.\n"
-        "5. Za ka samu weighted score da risk report.\n\n"
-        "📊 PILLARS:\n"
-        "Meme, Viral, News, Originality, Momentum,\n"
+        "4. Groq AI zai tantance narrative.\n"
+        "5. Zan lissafa score bisa bayanan da aka samu.\n\n"
+        "📊 <b>Narrative Pillars:</b>\n"
+        "Meme, Viral, News, Originality, Momentum, "
         "Longevity, Community da Connection.\n\n"
-        "🧾 EVIDENCE TYPES:\n"
-        "Verified = An samu shaida.\n"
-        "Missing = Ba a samu bayanin ba.\n"
-        "AI Interpretation = Fassarar AI daga bayanan da ake da su.\n\n"
-        "⚠️ Wannan bincike ne, ba buy/sell signal ba."
+        "🧠 Missing data ba ya zama zero score.\n"
+        "📊 Data Coverage zai nuna yawan bayanan da aka samu.\n\n"
+        "⚠️ Wannan Narrative Analysis ne kawai."
     )
 
 
 def how_to_use_message():
     return (
-        "📖 HOW TO USE JABIR RUNNER\n\n"
-        "1. Buɗe DexScreener.\n"
-        "2. Kwafi Contract Address.\n"
-        "3. Turo CA ɗin nan.\n"
-        "4. Jira market data.\n"
-        "5. Jira Narrative Engine.\n"
-        "6. Karanta rahoton da zai bayyana.\n\n"
-        "💡 Yi amfani da CA daidai.\n\n"
-        "⚠️ Ka tuna: Narrative analysis ba cikakken "
-        "contract security audit ba ne."
+        "📖 <b>HOW TO USE JABIR RUNNER</b>\n\n"
+        "1. Buɗe DexScreener ka samo CA.\n"
+        "2. Turo CA ɗin nan.\n"
+        "3. Zan ɗauko bayanan token.\n"
+        "4. Groq AI zai tantance narrative.\n"
+        "5. Za ka samu score, evidence da risks.\n\n"
+        "⚠️ Ka tabbatar CA ɗin da ka turo daidai ne."
     )
 
 
@@ -303,14 +369,20 @@ def how_to_use_message():
 # =====================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        welcome_message(),
-        reply_markup=main_keyboard()
-    )
+    if update.message:
+        await update.message.reply_text(
+            welcome_message(),
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
+        )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(help_message())
+    if update.message:
+        await update.message.reply_text(
+            help_message(),
+            parse_mode="HTML"
+        )
 
 
 # =====================================
@@ -324,193 +396,138 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "how_to_use":
         await query.edit_message_text(
             how_to_use_message(),
+            parse_mode="HTML",
             reply_markup=back_keyboard()
         )
 
     elif query.data == "back_home":
         await query.edit_message_text(
             welcome_message(),
+            parse_mode="HTML",
             reply_markup=main_keyboard()
         )
 
 
 # =====================================
-# DEXSCREENER API WITH CACHE
+# SAFE DATA HELPERS
+# =====================================
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def format_money(value):
+    value = safe_float(value)
+
+    if value >= 1_000_000_000:
+        return f"${value / 1_000_000_000:.2f}B"
+
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+
+    if value >= 1_000:
+        return f"${value / 1_000:.2f}K"
+
+    return f"${value:,.2f}"
+
+
+def format_price(value):
+    value = safe_float(value)
+
+    if value == 0:
+        return "Unavailable"
+
+    if value < 0.000001:
+        return f"${value:.10f}"
+
+    if value < 0.01:
+        return f"${value:.8f}"
+
+    return f"${value:.6f}"
+
+
+# =====================================
+# DEXSCREENER API
 # =====================================
 
 def get_dex_data(ca):
-
-    now = time.time()
-
-    # Check cache first
-    with DEX_LOCK:
-        cached = DEX_CACHE.get(ca)
-
-        if cached and now - cached["time"] < DEX_CACHE_TTL:
-            print(f"DexScreener cache hit: {ca}")
-            return cached["pair"]
-
     url = (
         "https://api.dexscreener.com/latest/dex/tokens/"
         f"{ca}"
     )
 
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "JabirRunner/2.0"
+    response = requests.get(
+        url,
+        timeout=25,
+        headers={"User-Agent": "JABIR-RUNNER/1.0"}
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+    pairs = data.get("pairs") or []
+
+    if not pairs:
+        return None
+
+    # Select pair with highest USD liquidity.
+    pair = max(
+        pairs,
+        key=lambda p: safe_float(
+            (p.get("liquidity") or {}).get("usd")
+        )
+    )
+
+    return pair
+
+
+# =====================================
+# MARKET DATA EXTRACTION
+# =====================================
+
+def extract_market_data(ca, pair):
+    base_token = pair.get("baseToken") or {}
+    quote_token = pair.get("quoteToken") or {}
+
+    liquidity = pair.get("liquidity") or {}
+    volume = pair.get("volume") or {}
+    price_change = pair.get("priceChange") or {}
+    txns = pair.get("txns") or {}
+    h24 = txns.get("h24") or {}
+
+    return {
+        "contract_address": ca,
+        "name": base_token.get("name") or "Unknown",
+        "ticker": base_token.get("symbol") or "?",
+        "chain": pair.get("chainId") or "Unknown",
+        "dex": pair.get("dexId") or "Unknown",
+        "price_usd": safe_float(pair.get("priceUsd")),
+        "liquidity_usd": safe_float(liquidity.get("usd")),
+        "volume_24h_usd": safe_float(volume.get("h24")),
+        "fdv_usd": safe_float(pair.get("fdv")),
+        "market_cap_usd": safe_float(pair.get("marketCap")),
+        "price_change_24h": safe_float(price_change.get("h24")),
+        "buys_24h": int(safe_float(h24.get("buys"))),
+        "sells_24h": int(safe_float(h24.get("sells"))),
+        "pair_created_at": pair.get("pairCreatedAt"),
+        "base_address": base_token.get("address"),
+        "quote_symbol": quote_token.get("symbol"),
+        "url": pair.get("url") or "",
     }
 
-    last_error = None
-
-    # Serialize API calls to reduce request bursts
-    with DEX_LOCK:
-
-        # Another request may have filled the cache
-        cached = DEX_CACHE.get(ca)
-
-        if cached and time.time() - cached["time"] < DEX_CACHE_TTL:
-            return cached["pair"]
-
-        for attempt in range(DEX_MAX_RETRIES + 1):
-
-            try:
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    timeout=20
-                )
-
-                if response.status_code == 429:
-
-                    retry_after = response.headers.get("Retry-After")
-
-                    try:
-                        wait = float(retry_after)
-                    except (TypeError, ValueError):
-                        wait = 2 ** (attempt + 1)
-
-                    if attempt < DEX_MAX_RETRIES:
-                        print(
-                            f"DexScreener rate limited. "
-                            f"Retrying after {wait}s"
-                        )
-                        time.sleep(min(wait, 15))
-                        continue
-
-                    raise RuntimeError(
-                        "DexScreener rate limit exceeded. "
-                        "Try again later."
-                    )
-
-                if response.status_code >= 500:
-                    if attempt < DEX_MAX_RETRIES:
-                        time.sleep(2 ** attempt)
-                        continue
-
-                response.raise_for_status()
-
-                data = response.json()
-                pairs = data.get("pairs") or []
-
-                if not pairs:
-                    return None
-
-                def get_liquidity(pair):
-                    try:
-                        return float(
-                            (pair.get("liquidity") or {}).get("usd") or 0
-                        )
-                    except (ValueError, TypeError):
-                        return 0
-
-                pair = max(pairs, key=get_liquidity)
-
-                DEX_CACHE[ca] = {
-                    "pair": pair,
-                    "time": time.time()
-                }
-
-                print(f"DexScreener data cached: {ca}")
-
-                return pair
-
-            except Exception as error:
-                last_error = error
-
-                if attempt < DEX_MAX_RETRIES:
-                    if isinstance(error, requests.RequestException):
-                        time.sleep(2 ** attempt)
-                        continue
-
-                break
-
-    raise RuntimeError(str(last_error or "DexScreener request failed"))
-
 
 # =====================================
-# DATA HELPERS
+# GROQ AI API
 # =====================================
 
-def safe_number(value):
-    try:
-        return float(value or 0)
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def money(value):
-    number = safe_number(value)
-
-    if number >= 1_000_000:
-        return f"${number / 1_000_000:.2f}M"
-
-    if number >= 1_000:
-        return f"${number / 1_000:.2f}K"
-
-    return f"${number:,.2f}"
-
-
-def extract_dex_info(pair):
-
-    base = pair.get("baseToken") or {}
-    liquidity = (pair.get("liquidity") or {}).get("usd", 0)
-    volume = (pair.get("volume") or {}).get("h24", 0)
-
-    info = {
-        "name": base.get("name", "Unknown"),
-        "ticker": base.get("symbol", "?"),
-        "chain": pair.get("chainId", "?"),
-        "price": pair.get("priceUsd", "?"),
-        "liquidity": safe_number(liquidity),
-        "volume_24h": safe_number(volume),
-        "fdv": safe_number(pair.get("fdv")),
-        "dex": pair.get("dexId", "Unknown"),
-        "pair_url": pair.get("url", ""),
-        "pair_address": pair.get("pairAddress", ""),
-        "base_token_address": base.get("address", ""),
-        "quote_token": (pair.get("quoteToken") or {}).get("symbol", "?"),
-        "price_change_24h": safe_number(
-            (pair.get("priceChange") or {}).get("h24")
-        ),
-        "buys_24h": safe_number(
-            (pair.get("txns") or {}).get("h24", {}).get("buys")
-        ),
-        "sells_24h": safe_number(
-            (pair.get("txns") or {}).get("h24", {}).get("sells")
-        ),
-    }
-
-    return info
-
-
-# =====================================
-# GROQ NARRATIVE ENGINE
-# =====================================
-
-def analyze_with_groq(ca, dex_info):
-
+def analyze_with_groq(market_data):
     if not GROQ_KEY:
-        raise ValueError("GROQ_API_KEY is missing.")
+        raise ValueError("GROQ_API_KEY is missing in Render.")
 
     url = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -529,16 +546,13 @@ def analyze_with_groq(ca, dex_info):
             {
                 "role": "user",
                 "content": (
-                    f"Contract Address: {ca}\n\n"
-                    f"DexScreener Data:\n"
-                    f"{json.dumps(dex_info, ensure_ascii=False)}\n\n"
-                    "Yi nazarin bayanan nan. Ka dawo da valid JSON kawai."
+                    "Analyze this token using ONLY the supplied data.\n"
+                    "Remember: all liquidity and volume values are USD.\n"
+                    "Return valid JSON only.\n\n"
+                    f"{json.dumps(market_data, ensure_ascii=False)}"
                 ),
             },
         ],
-        "response_format": {
-            "type": "json_object"
-        },
         "temperature": 0.2,
         "max_tokens": 2200,
     }
@@ -562,109 +576,168 @@ def analyze_with_groq(ca, dex_info):
     if not choices:
         raise RuntimeError("Groq returned no choices.")
 
-    content = choices[0].get("message", {}).get("content")
+    content = (
+        choices[0]
+        .get("message", {})
+        .get("content")
+    )
 
     if not content:
         raise RuntimeError("Groq returned an empty response.")
 
+    # Remove accidental Markdown fences if the model adds them.
+    content = content.strip()
+
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?", "", content).strip()
+        content = re.sub(r"```$", "", content).strip()
+
     try:
-        result = json.loads(content)
-    except json.JSONDecodeError:
-        raise RuntimeError("Groq returned invalid JSON.")
-
-    if not isinstance(result, dict):
-        raise RuntimeError("Groq returned an invalid report structure.")
-
-    return result
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Groq returned invalid JSON: {content[:300]}"
+        ) from exc
 
 
 # =====================================
-# VALIDATE AND CALCULATE SCORES
+# VALIDATE SCORES AND CALCULATE TOTAL
 # =====================================
 
-def validate_analysis(analysis):
+def calculate_score(analysis):
+    scores = analysis.get("scores") or {}
 
-    scores = analysis.get("scores")
+    available_weight = 0
+    weighted_points = 0
+    verified_count = 0
+    missing_pillars = []
 
-    if not isinstance(scores, dict):
-        raise ValueError("Missing score structure.")
+    clean_scores = {}
 
-    validated = {}
+    for pillar, weight in PILLARS.items():
+        item = scores.get(pillar) or {}
 
-    for key in WEIGHTS:
-
-        item = scores.get(key)
-
-        if not isinstance(item, dict):
-            raise ValueError(f"Missing pillar: {key}")
-
-        try:
-            score = float(item.get("score"))
-        except (ValueError, TypeError):
-            raise ValueError(f"Invalid score: {key}")
-
-        if not 0 <= score <= 10:
-            raise ValueError(f"Score out of range: {key}")
-
-        evidence = str(item.get("evidence") or "Ba a bayar da shaida ba.")
-
-        evidence_type = str(
-            item.get("evidence_type") or "Missing"
-        )
+        score = item.get("score")
+        evidence = str(item.get("evidence") or "Babu cikakkiyar hujja.")
+        evidence_type = str(item.get("type") or "Missing")
 
         if evidence_type not in (
             "Verified",
-            "Missing",
-            "AI Interpretation"
+            "AI Interpretation",
+            "Missing"
         ):
-            evidence_type = "AI Interpretation"
+            evidence_type = "Missing"
 
-        validated[key] = {
+        # Missing evidence must never become zero.
+        if evidence_type == "Missing" or score is None:
+            score = None
+            evidence_type = "Missing"
+            missing_pillars.append(pillar)
+
+        else:
+            score = safe_float(score, -1)
+
+            if score < 0 or score > 10:
+                score = None
+                evidence_type = "Missing"
+                missing_pillars.append(pillar)
+
+            else:
+                available_weight += weight
+                weighted_points += score * weight
+
+                if evidence_type == "Verified":
+                    verified_count += 1
+
+        clean_scores[pillar] = {
             "score": score,
+            "weight": weight,
             "evidence": evidence,
-            "evidence_type": evidence_type,
+            "type": evidence_type,
         }
 
-    # Deterministic weighted calculation
-    total = sum(
-        validated[key]["score"] * weight / 100
-        for key, weight in WEIGHTS.items()
-    )
-
-    if total >= 7.5:
-        rating = "GREEN"
-    elif total >= 5:
-        rating = "YELLOW"
+    if available_weight > 0:
+        total_score = weighted_points / available_weight
     else:
-        rating = "RED"
+        total_score = None
 
-    analysis["scores"] = validated
-    analysis["total_score"] = round(total, 2)
-    analysis["rating"] = rating
+    coverage = available_weight
 
-    return analysis
+    # Confidence is based on evidence coverage.
+    # With DexScreener as the only source, High is not allowed.
+    if coverage < 60:
+        confidence = "Low"
+    else:
+        confidence = "Medium"
 
+    verified_negative = analysis.get(
+        "verified_negative_evidence"
+    ) or []
 
-# =====================================
-# PROFESSIONAL REPORT UI
-# =====================================
+    # Classification rules:
+    # Missing evidence is never a reason for RED.
+    if coverage < 60 or total_score is None:
+        classification = "NEED MORE DATA"
 
-def format_report(info, analysis):
+    elif verified_negative and total_score < 5:
+        classification = "RED"
 
-    analysis = validate_analysis(analysis)
+    elif total_score >= 7.5 and coverage >= 75:
+        classification = "GREEN"
 
-    name = info["name"]
-    ticker = info["ticker"]
-    chain = info["chain"]
+    else:
+        classification = "YELLOW"
 
-    total = analysis["total_score"]
-    rating = analysis["rating"]
-
-    icons = {
-        "GREEN": "🟢",
-        "YELLOW": "🟡",
-        "RED": "🔴",
+    return {
+        "scores": clean_scores,
+        "total_score": total_score,
+        "coverage": coverage,
+        "confidence": confidence,
+        "classification": classification,
+        "missing_pillars": missing_pillars,
+        "verified_negative": verified_negative,
+        "verified_count": verified_count,
     }
+
+
+# =====================================
+# REPORT FORMATTING
+# =====================================
+
+def format_report(market, analysis):
+    result = calculate_score(analysis)
+
+    name = market["name"]
+    ticker = market["ticker"]
+    chain = market["chain"]
+    dex = market["dex"]
+
+    price = format_price(market["price_usd"])
+    liquidity = format_money(market["liquidity_usd"])
+    volume = format_money(market["volume_24h_usd"])
+    fdv = format_money(market["fdv_usd"])
+
+    change = market["price_change_24h"]
+    change_text = f"{change:+.2f}%"
+
+    buys = market["buys_24h"]
+    sells = market["sells_24h"]
+
+    total_score = result["total_score"]
+
+    if total_score is None:
+        score_text = "N/A"
+    else:
+        score_text = f"{total_score:.2f}/10"
+
+    classification = result["classification"]
+
+    if classification == "GREEN":
+        class_icon = "🟢"
+    elif classification == "RED":
+        class_icon = "🔴"
+    else:
+        class_icon = "🟡"
 
     lines = [
         "🚀 JABIR RUNNER REPORT",
@@ -672,40 +745,54 @@ def format_report(info, analysis):
         "",
         f"🪙 {name} (${ticker})",
         f"⛓️ Chain: {chain}",
-        f"📍 DEX: {info['dex']}",
+        f"📍 DEX: {dex}",
         "",
         "📊 MARKET SNAPSHOT",
-        f"💵 Price: ${info['price']}",
-        f"💧 Liquidity: {money(info['liquidity'])}",
-        f"📈 Volume 24h: {money(info['volume_24h'])}",
-        f"🏷️ FDV: {money(info['fdv'])}",
-        f"🔄 Price Change 24h: {info['price_change_24h']:+.2f}%",
-        f"🟢 Buys: {int(info['buys_24h'])} | "
-        f"🔴 Sells: {int(info['sells_24h'])}",
+        f"💵 Price: {price}",
+        f"💧 Liquidity: {liquidity} USD",
+        f"📈 Volume 24h: {volume} USD",
+        f"🏷️ FDV: {fdv}",
+        f"🔄 Price Change 24h: {change_text}",
+        f"🟢 Buys: {buys} | 🔴 Sells: {sells}",
         "",
         "🧠 NARRATIVE INTELLIGENCE",
-        str(analysis.get("narrative", "Ba a gano narrative ba.")),
+        str(analysis.get("narrative") or "Ba a samu cikakken bayani ba."),
+        "",
+        "👥 AUDIENCE",
+        str(analysis.get("audience") or "Unverified"),
+        "",
+        "🌍 CULTURAL RELEVANCE",
+        str(analysis.get("cultural_relevance") or "Unverified"),
+        "",
+        "🏷️ BRAND CONNECTION",
+        str(analysis.get("brand_connection") or "Unverified"),
         "",
         "⚖️ PILLAR SCORES",
+        "",
     ]
 
-    for key, weight in WEIGHTS.items():
+    for pillar, item in result["scores"].items():
+        score = item["score"]
+        weight = item["weight"]
 
-        item = analysis["scores"][key]
+        if score is None:
+            score_text_pillar = "N/A"
+        else:
+            score_text_pillar = f"{score:.1f}/10"
 
         lines.extend([
-            "",
-            f"• {PILLAR_LABELS[key]}: "
-            f"{item['score']:.1f}/10 ({weight}%)",
+            f"• {pillar}: {score_text_pillar} ({weight}%)",
             f"  Evidence: {item['evidence']}",
-            f"  Type: {item['evidence_type']}",
+            f"  Type: {item['type']}",
+            "",
         ])
 
     lines.extend([
-        "",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"{icons[rating]} TOTAL SCORE: {total:.2f}/10",
-        f"🏁 CLASSIFICATION: {rating}",
+        f"📊 WEIGHTED SCORE: {score_text}",
+        f"📡 DATA COVERAGE: {result['coverage']}%",
+        f"{class_icon} CLASSIFICATION: {classification}",
+        f"🎯 CONFIDENCE: {result['confidence']}",
         "",
         "📚 CATALYSTS",
     ])
@@ -714,17 +801,35 @@ def format_report(info, analysis):
 
     if catalysts:
         for catalyst in catalysts[:5]:
-            lines.append(f"• {catalyst}")
-    else:
-        lines.append("• None verified in supplied data.")
+            if isinstance(catalyst, dict):
+                item = catalyst.get("item", "Unknown")
+                evidence = catalyst.get("evidence", "")
+                evidence_type = catalyst.get("type", "Unverified")
 
-    lifespan = analysis.get("lifespan") or {}
+                lines.append(f"• {item}")
+                if evidence:
+                    lines.append(f"  Evidence: {evidence}")
+                lines.append(f"  Type: {evidence_type}")
+            else:
+                lines.append(f"• {catalyst}")
+    else:
+        lines.append("• Babu verified catalyst a cikin bayanan da aka bayar.")
 
     lines.extend([
         "",
         "⏳ NARRATIVE LIFESPAN",
-        f"Estimate: {lifespan.get('estimate', 'Uncertain')}",
-        str(lifespan.get("reason", "Ba a samu isasshen bayani ba.")),
+    ])
+
+    lifespan = analysis.get("lifespan") or {}
+
+    lines.append(
+        f"Estimate: {lifespan.get('estimate', 'Uncertain')}"
+    )
+    lines.append(
+        str(lifespan.get('reason') or "Babu isasshen tarihi.")
+    )
+
+    lines.extend([
         "",
         "⚠️ TOP RISKS",
     ])
@@ -732,72 +837,112 @@ def format_report(info, analysis):
     risks = analysis.get("risks") or []
 
     if risks:
-        for index, risk in enumerate(risks[:3], 1):
-            lines.append(f"{index}. {risk}")
+        for index, risk in enumerate(risks[:3], start=1):
+            if isinstance(risk, dict):
+                item = risk.get("item", "Unspecified risk")
+                risk_type = risk.get("type", "Unverified")
+                lines.append(f"{index}. {item} ({risk_type})")
+            else:
+                lines.append(f"{index}. {risk}")
     else:
-        lines.append("Ba a bayar da cikakken risk list ba.")
+        lines.append("1. Ba a samu cikakken bayanin haɗari ba.")
 
     lines.extend([
         "",
         "🔎 UNVERIFIED ITEMS",
     ])
 
-    unverified = analysis.get("unverified") or []
+    unverified = analysis.get("unverified_items") or []
+
+    # Always include missing pillars.
+    for pillar in result["missing_pillars"]:
+        label = f"{pillar}: babu isasshiyar hujja"
+
+        if label not in unverified:
+            unverified.append(label)
 
     if unverified:
-        for item in unverified[:8]:
+        for item in unverified[:10]:
             lines.append(f"• {item}")
     else:
-        lines.append("• No additional items listed.")
+        lines.append("• Babu ƙarin abubuwan da aka jera.")
+
+    if result["verified_negative"]:
+        lines.extend([
+            "",
+            "🚨 VERIFIED NEGATIVE EVIDENCE",
+        ])
+
+        for item in result["verified_negative"][:5]:
+            lines.append(f"• {item}")
 
     lines.extend([
         "",
-        f"🎯 CONFIDENCE: {analysis.get('confidence', 'Low')}",
-        "",
         "━━━━━━━━━━━━━━━━━━━━",
         "📌 DATA LIMITATION",
-        "Wannan bincike ya dogara ne da bayanan DexScreener "
-        "da aka samu. Ba a tabbatar da social activity, "
-        "holders, dev wallets ko contract security ba.",
+        str(
+            analysis.get("limitations")
+            or "Binciken ya dogara da bayanan DexScreener."
+        ),
         "",
-        "⚠️ Kada ka yanke shawarar siye ko sayarwa "
-        "bisa wannan report kawai.",
+        "DexScreener data ba ya tabbatar da social activity, "
+        "holders, dev wallets ko contract security.",
         "",
-        f"🔗 DexScreener: {info['pair_url']}",
+        "⚠️ Kada ka yanke shawarar siye ko sayarwa bisa "
+        "wannan report kawai.",
         "",
-        "JABIR RUNNER | See Beyond The Chart."
+    ])
+
+    humor = analysis.get("humor")
+
+    if humor:
+        lines.extend([
+            "😄 RUNNER'S CORNER",
+            str(humor),
+            "",
+        ])
+
+    lines.extend([
+        f"🔗 DexScreener: {market['url']}",
+        "",
+        "JABIR RUNNER | See Beyond The Chart.",
     ])
 
     return "\n".join(lines)
 
 
 # =====================================
-# TELEGRAM MESSAGE SENDER
+# TELEGRAM REPORT SENDER
 # =====================================
 
-async def send_report(status, report):
-
-    # Keep each Telegram message safely below 4096 chars
-    limit = 3800
-
+def split_message(text, limit=3900):
     chunks = []
+    current = ""
 
-    while len(report) > limit:
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > limit:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current += ("\n" if current else "") + line
 
-        split_at = report.rfind("\n", 0, limit)
+    if current:
+        chunks.append(current)
 
-        if split_at < 1:
-            split_at = limit
+    return chunks
 
-        chunks.append(report[:split_at])
-        report = report[split_at:].lstrip()
 
-    chunks.append(report)
+async def send_report(status, report, context):
+    chunks = split_message(report)
 
-    await status.edit_text(chunks[0])
+    await status.edit_text(
+        chunks[0],
+        disable_web_page_preview=True
+    )
 
     for chunk in chunks[1:]:
-        await status.get_bot().send_message(
+        await context.bot.send_message(
             chat_id=status.chat_id,
             text=chunk,
             disable_web_page_preview=True
@@ -808,28 +953,22 @@ async def send_report(status, report):
 # CONTRACT ADDRESS HANDLER
 # =====================================
 
-async def handle_ca(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    text = update.message.text.strip()
+    message_text = update.message.text.strip()
 
     ca_match = re.search(
         r"(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})",
-        text
+        message_text
     )
 
     if not ca_match:
-
         await update.message.reply_text(
             "❌ Ban gane CA ba.\n\n"
             "Ka turo Contract Address kawai."
         )
-
         return
 
     ca = ca_match.group(1)
@@ -840,82 +979,76 @@ async def handle_ca(
         "⏳ Ina ɗauko bayanan DexScreener..."
     )
 
-    # =================================
-    # DEXSCREENER
-    # =================================
+    # FETCH DEXSCREENER DATA
 
     try:
-
         pair = await asyncio.to_thread(
             get_dex_data,
             ca
         )
 
     except Exception as error:
-
         print(f"DexScreener Error: {error}")
 
         await status.edit_text(
-            "❌ DEXSCREENER ERROR\n\n"
-            "An samu matsala wajen ɗauko bayanai.\n"
-            "Idan rate limit ne, jira kaɗan kafin sake gwadawa."
+            "❌ SCAN FAILED\n\n"
+            "An samu matsala wajen haɗuwa da DexScreener.\n"
+            "Ka sake gwadawa daga baya."
         )
-
         return
 
     if not pair:
-
         await status.edit_text(
             "❌ TOKEN NOT FOUND\n\n"
-            "Ba a samu token ɗin a DexScreener ba.\n"
+            "Ban samu token ɗin a DexScreener ba.\n"
             "Ka tabbatar CA ɗin daidai ne."
         )
-
         return
 
-    # =================================
-    # EXTRACT DATA
-    # =================================
+    # EXTRACT MARKET DATA
 
-    info = extract_dex_info(pair)
-
-    # =================================
-    # GROQ ANALYSIS
-    # =================================
+    market = extract_market_data(ca, pair)
 
     await status.edit_text(
         "🧠 JABIR RUNNER NARRATIVE ENGINE\n\n"
-        "✅ Market data received.\n"
-        "⏳ Ana nazarin narrative da evidence..."
+        "✅ DexScreener data received.\n"
+        "⏳ Groq AI na nazarin narrative..."
     )
 
-    try:
+    # GROQ ANALYSIS
 
+    try:
         analysis = await asyncio.to_thread(
             analyze_with_groq,
-            ca,
-            info
+            market
         )
 
-        report = format_report(info, analysis)
+        report = format_report(
+            market,
+            analysis
+        )
 
-        await send_report(status, report)
+        await send_report(
+            status,
+            report,
+            context
+        )
 
     except Exception as error:
-
         print(f"Groq Analysis Error: {error}")
 
         fallback = (
-            "🚀 JABIR RUNNER MARKET REPORT\n\n"
-            f"🪙 {info['name']} (${info['ticker']})\n"
-            f"⛓️ Chain: {info['chain']}\n\n"
-            f"💧 Liquidity: {money(info['liquidity'])}\n"
-            f"📈 Volume 24h: {money(info['volume_24h'])}\n"
-            f"🏷️ FDV: {money(info['fdv'])}\n\n"
-            "⚠️ Narrative Analysis bai yi nasara ba.\n"
-            "Ba a samar da narrative score ba.\n\n"
-            "Duba Render Logs domin ganin ainihin kuskuren.\n\n"
-            f"🔗 {info['pair_url']}"
+            "🚀 JABIR RUNNER REPORT\n\n"
+            f"{market['name']} (${market['ticker']})\n"
+            f"Chain: {market['chain']}\n"
+            f"DEX: {market['dex']}\n\n"
+            f"Price: {format_price(market['price_usd'])}\n"
+            f"Liquidity: {format_money(market['liquidity_usd'])} USD\n"
+            f"Volume 24h: {format_money(market['volume_24h_usd'])} USD\n"
+            f"FDV: {format_money(market['fdv_usd'])}\n\n"
+            "⚠️ AI Narrative Analysis bai samu nasara ba.\n"
+            "Ka duba Render Logs domin ganin ainihin kuskuren.\n\n"
+            f"DexScreener: {market['url']}"
         )
 
         await status.edit_text(
@@ -963,7 +1096,7 @@ if __name__ == "__main__":
         )
     )
 
-    print("JABIR RUNNER v2 starting with Webhook...")
+    print("JABIR RUNNER starting with Webhook...")
 
     app.run_webhook(
         listen="0.0.0.0",
