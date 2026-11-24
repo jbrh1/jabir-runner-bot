@@ -1,1109 +1,885 @@
+"""
+JABIR RUNNER V2
+Solana token scanner | Python 3.11 | python-telegram-bot 21+ | DexScreener + Helius + Groq
+Run mode: Render Webhook (requires RENDER_EXTERNAL_URL and WEBHOOK_SECRET)
+"""
+from __future__ import annotations
 
+import asyncio
+import base64
+import html
+import json
+import logging
+import math
 import os
 import re
-import json
-import asyncio
-import requests
+import sqlite3
+import time
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+import httpx
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters,
 )
 
-# =====================================
-# ENVIRONMENT VARIABLES
-# =====================================
+# ------------------------------ CONFIG ---------------------------------------
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
+HELIUS_KEY = os.getenv("HELIUS_API_KEY")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("BOT_TOKEN")
-GROQ_KEY = os.environ.get("GROQ_API_KEY")
-
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
-PORT = int(os.environ.get("PORT", 10000))
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 WEBHOOK_PATH = "telegram-webhook"
 
-GROQ_MODEL = "openai/gpt-oss-120b"
+DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+DEX_ORDERS_URL = "https://api.dexscreener.com/orders/v1/solana/{}"
+HELIUS_RPC_URL = "https://mainnet.helius-rpc.com/"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# =====================================
-# BOT BRANDING
-# =====================================
+DB_PATH = os.getenv("DB_PATH", "jabir_runner.db")
+CACHE_TTL = int(os.getenv("CACHE_TTL", "25"))
+CACHE_MAX = 500
+MAX_HOLDER_PAGES = 10
+HOLDER_PAGE_SIZE = 1000
 
-BOT_NAME = "JABIR RUNNER"
-BOT_TAGLINE = "See Beyond The Chart."
+BUNDLE_AVOID = 40.0
+DEV_LEFT_AVOID = 5.0
+FAKE_HOLDER_AVOID = 30.0
 
-# =====================================
-# SCORING WEIGHTS
-# =====================================
-
-PILLARS = {
-    "Meme Simplicity": 15,
-    "Viral Post Evidence": 20,
-    "Strong News Evidence": 20,
-    "Originality": 10,
-    "Momentum": 10,
-    "Longevity": 10,
-    "Community Authenticity": 10,
-    "Narrative-Token Connection": 5,
+TEST_TOKENS = {
+    "testicles": "3pGmCpDCr2B6cZFhFJFtLrcMCadMvjV4dB9UGJyNpump",
+    "pengu": "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv",
+    "grokius": "67ezHLk8PUkjJCXjmmgPbx85VowA52ghfRXa9A8Tpump",
 }
 
-# =====================================
-# GROQ SYSTEM PROMPT
-# =====================================
-
-SYSTEM_PROMPT = """
-You are JABIR RUNNER, a careful Solana token narrative analyst.
-
-Your job is to analyze token narratives using the supplied
-DexScreener market data.
-
-IMPORTANT SOURCE LIMITATION:
-
-The only factual source supplied to you is DexScreener data.
-You have NOT searched X, Telegram, websites, news, exchanges,
-holder analytics, blockchain explorers or project documents.
-
-Never pretend that you searched those sources.
-
-Never invent:
-- Social media posts or follower counts.
-- Partnerships or exchange listings.
-- Physical products or brand achievements.
-- Community size or authenticity.
-- Developer activity or holder distribution.
-- Audits or contract safety.
-- Historical performance not supplied in the data.
-
-A token name alone is not proof of a real-world brand,
-community, cultural influence or established narrative.
-
-If a real-world brand connection is not supported by
-the supplied evidence, describe it as unverified.
-
-EVIDENCE TYPES:
-
-Every pillar must have one of these evidence types:
-
-1. Verified:
-   Directly supported by supplied DexScreener data.
-
-2. AI Interpretation:
-   A cautious interpretation of supplied information.
-   It is not an independently verified fact.
-
-3. Missing:
-   No meaningful evidence is available.
-
-CRITICAL SCORING RULE:
-
-If evidence is Missing, set that pillar's score to null.
-Do NOT give it 0/10.
-
-A missing pillar is excluded from the weighted score.
-Do not punish a token for data DexScreener does not provide.
-
-Only score a pillar when there is meaningful evidence.
-
-SCORING PILLARS:
-
-1. Meme Simplicity: 15%
-2. Viral Post Evidence: 20%
-3. Strong News Evidence: 20%
-4. Originality: 10%
-5. Momentum: 10%
-6. Longevity: 10%
-7. Community Authenticity: 10%
-8. Narrative-Token Connection: 5%
-
-MOMENTUM RULES:
-
-Use the supplied market data carefully.
-
-Volume and liquidity are denominated in USD.
-Never label them as SOL.
-
-Trading volume is not proof of community authenticity.
-Buys exceeding sells do not prove organic demand.
-Price increase is not proof of a news catalyst.
-High volume is not automatically bullish.
-
-You may score Momentum using price change, volume,
-liquidity and buy/sell activity, but explain the limitations.
-
-NARRATIVE INTELLIGENCE:
-
-Explain the possible narrative, audience and cultural meaning
-only when supported by evidence.
-
-If the data only gives a token name and ticker,
-do not invent a detailed brand story.
-
-If external brand information is unavailable,
-say that the real-world narrative requires verification.
-
-CATALYSTS:
-
-Only list verified catalysts if actual evidence exists.
-
-A price increase, trading volume or buy/sell activity
-is market activity, NOT a verified news catalyst.
-
-CLASSIFICATION:
-
-Do not calculate the final weighted score yourself.
-Python will calculate it.
-
-List verified negative evidence separately.
-Only include negative evidence that is directly supported
-by the supplied data.
-
-Do not label missing data as negative evidence.
-
-RISKS:
-
-List meaningful risks supported by the available data.
-Clearly distinguish verified risks from unverified concerns.
-
-NARRATIVE LIFESPAN:
-
-Use "Uncertain" when there is insufficient historical evidence.
-Do not predict lifespan confidently from 24-hour data.
-
-HUMOR:
-
-Include one short, clean Hausa joke related to charts,
-trading or research.
-
-Keep it friendly and harmless.
-Do not joke about financial losses or encourage trading.
-
-LANGUAGE:
-
-Write the analysis in natural Hausa.
-Keep technical terms understandable.
-
-OUTPUT:
-
-Return ONLY valid JSON. Do not use Markdown fences.
-
-Use exactly this structure:
-
-{
-  "narrative": "Hausa narrative explanation",
-  "audience": "Known audience or Unverified",
-  "cultural_relevance": "Supported explanation or Unverified",
-  "brand_connection": "Supported explanation or Unverified",
-  "catalysts": [
-    {
-      "item": "Catalyst",
-      "evidence": "Evidence",
-      "type": "Verified"
-    }
-  ],
-  "scores": {
-    "Meme Simplicity": {
-      "score": 0,
-      "evidence": "Explanation",
-      "type": "AI Interpretation"
-    },
-    "Viral Post Evidence": {
-      "score": null,
-      "evidence": "No social data supplied",
-      "type": "Missing"
-    },
-    "Strong News Evidence": {
-      "score": null,
-      "evidence": "No news data supplied",
-      "type": "Missing"
-    },
-    "Originality": {
-      "score": null,
-      "evidence": "Explanation",
-      "type": "Missing"
-    },
-    "Momentum": {
-      "score": 0,
-      "evidence": "Market data explanation",
-      "type": "Verified"
-    },
-    "Longevity": {
-      "score": null,
-      "evidence": "No historical data supplied",
-      "type": "Missing"
-    },
-    "Community Authenticity": {
-      "score": null,
-      "evidence": "No community data supplied",
-      "type": "Missing"
-    },
-    "Narrative-Token Connection": {
-      "score": null,
-      "evidence": "Explanation",
-      "type": "Missing"
-    }
-  },
-  "verified_negative_evidence": [],
-  "risks": [
-    {
-      "item": "Risk",
-      "type": "Verified"
-    }
-  ],
-  "unverified_items": [
-    "Social media activity",
-    "Community authenticity",
-    "Holder distribution",
-    "Developer wallets",
-    "Contract security"
-  ],
-  "lifespan": {
-    "estimate": "Uncertain",
-    "reason": "Explanation"
-  },
-  "humor": "One short Hausa joke",
-  "limitations": "Explain what this analysis cannot verify"
-}
-
-IMPORTANT:
-- Replace example scores with your actual assessment.
-- Use null for missing scores.
-- Scores must be between 0 and 10.
-- Never use 0 just because evidence is missing.
-- If a pillar has no meaningful evidence, use null and Missing.
-- Never invent a catalyst.
-- Never claim a project is safe.
-"""
-
-
-# =====================================
-# KEYBOARDS
-# =====================================
-
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📖 How to Use",
-                callback_data="how_to_use"
-            )
-        ]
-    ])
-
-
-def back_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🏠 Back to Home",
-                callback_data="back_home"
-            )
-        ]
-    ])
-
-
-# =====================================
-# MESSAGE TEMPLATES
-# =====================================
-
-def welcome_message():
-    return (
-        "🚀 <b>JABIR RUNNER</b>\n"
-        "<i>See Beyond The Chart.</i>\n\n"
-        "🔍 <b>Solana Token Narrative Intelligence</b>\n\n"
-        "Barka da zuwa Jabir Runner!\n"
-        "Ni ne mataimakinka wajen binciken "
-        "narrative da bayanan token.\n\n"
-        "📊 <b>Abin da zan iya yi:</b>\n"
-        "• Token Narrative Analysis\n"
-        "• Evidence-Based Scoring\n"
-        "• Market Data from DexScreener\n"
-        "• Risk Awareness\n"
-        "• Narrative Intelligence\n\n"
-        "👇 <b>Yadda za ka fara:</b>\n"
-        "Turo min Contract Address (CA).\n\n"
-        "⚠️ <i>Narrative score ba ya tabbatar da "
-        "cewa token yana da aminci.</i>"
-    )
-
-
-def help_message():
-    return (
-        "📖 <b>JABIR RUNNER GUIDE</b>\n\n"
-        "Yadda nake aiki:\n\n"
-        "1. Ka samo Contract Address (CA).\n"
-        "2. Ka turo min CA ɗin.\n"
-        "3. Zan ɗauko bayanai daga DexScreener.\n"
-        "4. Groq AI zai tantance narrative.\n"
-        "5. Zan lissafa score bisa bayanan da aka samu.\n\n"
-        "📊 <b>Narrative Pillars:</b>\n"
-        "Meme, Viral, News, Originality, Momentum, "
-        "Longevity, Community da Connection.\n\n"
-        "🧠 Missing data ba ya zama zero score.\n"
-        "📊 Data Coverage zai nuna yawan bayanan da aka samu.\n\n"
-        "⚠️ Wannan Narrative Analysis ne kawai."
-    )
-
-
-def how_to_use_message():
-    return (
-        "📖 <b>HOW TO USE JABIR RUNNER</b>\n\n"
-        "1. Buɗe DexScreener ka samo CA.\n"
-        "2. Turo CA ɗin nan.\n"
-        "3. Zan ɗauko bayanan token.\n"
-        "4. Groq AI zai tantance narrative.\n"
-        "5. Za ka samu score, evidence da risks.\n\n"
-        "⚠️ Ka tabbatar CA ɗin da ka turo daidai ne."
-    )
-
-
-# =====================================
-# TELEGRAM COMMANDS
-# =====================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            welcome_message(),
-            parse_mode="HTML",
-            reply_markup=main_keyboard()
-        )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            help_message(),
-            parse_mode="HTML"
-        )
-
-
-# =====================================
-# BUTTON HANDLER
-# =====================================
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "how_to_use":
-        await query.edit_message_text(
-            how_to_use_message(),
-            parse_mode="HTML",
-            reply_markup=back_keyboard()
-        )
-
-    elif query.data == "back_home":
-        await query.edit_message_text(
-            welcome_message(),
-            parse_mode="HTML",
-            reply_markup=main_keyboard()
-        )
-
-
-# =====================================
-# SAFE DATA HELPERS
-# =====================================
-
-def safe_float(value, default=0.0):
+SOL_ADDR_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])")
+BAR = "━━━━━━━━━━━━"
+log = logging.getLogger("jabir_runner")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_http: Optional[httpx.AsyncClient] = None
+
+
+# ------------------------------ HELPERS --------------------------------------
+def safe_num(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        if value is None:
-            return default
-        return float(value)
-    except (ValueError, TypeError):
-        return default
-
-
-def format_money(value):
-    value = safe_float(value)
-
-    if value >= 1_000_000_000:
-        return f"${value / 1_000_000_000:.2f}B"
-
-    if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
-
-    if value >= 1_000:
-        return f"${value / 1_000:.2f}K"
-
-    return f"${value:,.2f}"
-
-
-def format_price(value):
-    value = safe_float(value)
-
-    if value == 0:
-        return "Unavailable"
-
-    if value < 0.000001:
-        return f"${value:.10f}"
-
-    if value < 0.01:
-        return f"${value:.8f}"
-
-    return f"${value:.6f}"
-
-
-# =====================================
-# DEXSCREENER API
-# =====================================
-
-def get_dex_data(ca):
-    url = (
-        "https://api.dexscreener.com/latest/dex/tokens/"
-        f"{ca}"
-    )
-
-    response = requests.get(
-        url,
-        timeout=25,
-        headers={"User-Agent": "JABIR-RUNNER/1.0"}
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-    pairs = data.get("pairs") or []
-
-    if not pairs:
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
-    # Select pair with highest USD liquidity.
-    pair = max(
-        pairs,
-        key=lambda p: safe_float(
-            (p.get("liquidity") or {}).get("usd")
-        )
-    )
 
-    return pair
-
-
-# =====================================
-# MARKET DATA EXTRACTION
-# =====================================
-
-def extract_market_data(ca, pair):
-    base_token = pair.get("baseToken") or {}
-    quote_token = pair.get("quoteToken") or {}
-
-    liquidity = pair.get("liquidity") or {}
-    volume = pair.get("volume") or {}
-    price_change = pair.get("priceChange") or {}
-    txns = pair.get("txns") or {}
-    h24 = txns.get("h24") or {}
-
-    return {
-        "contract_address": ca,
-        "name": base_token.get("name") or "Unknown",
-        "ticker": base_token.get("symbol") or "?",
-        "chain": pair.get("chainId") or "Unknown",
-        "dex": pair.get("dexId") or "Unknown",
-        "price_usd": safe_float(pair.get("priceUsd")),
-        "liquidity_usd": safe_float(liquidity.get("usd")),
-        "volume_24h_usd": safe_float(volume.get("h24")),
-        "fdv_usd": safe_float(pair.get("fdv")),
-        "market_cap_usd": safe_float(pair.get("marketCap")),
-        "price_change_24h": safe_float(price_change.get("h24")),
-        "buys_24h": int(safe_float(h24.get("buys"))),
-        "sells_24h": int(safe_float(h24.get("sells"))),
-        "pair_created_at": pair.get("pairCreatedAt"),
-        "base_address": base_token.get("address"),
-        "quote_symbol": quote_token.get("symbol"),
-        "url": pair.get("url") or "",
-    }
-
-
-# =====================================
-# GROQ AI API
-# =====================================
-
-def analyze_with_groq(market_data):
-    if not GROQ_KEY:
-        raise ValueError("GROQ_API_KEY is missing in Render.")
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Analyze this token using ONLY the supplied data.\n"
-                    "Remember: all liquidity and volume values are USD.\n"
-                    "Return valid JSON only.\n\n"
-                    f"{json.dumps(market_data, ensure_ascii=False)}"
-                ),
-            },
-        ],
-        "temperature": 0.2,
-        "max_tokens": 2200,
-    }
-
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=90,
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"Groq HTTP {response.status_code}: "
-            f"{response.text[:500]}"
-        )
-
-    data = response.json()
-    choices = data.get("choices") or []
-
-    if not choices:
-        raise RuntimeError("Groq returned no choices.")
-
-    content = (
-        choices[0]
-        .get("message", {})
-        .get("content")
-    )
-
-    if not content:
-        raise RuntimeError("Groq returned an empty response.")
-
-    # Remove accidental Markdown fences if the model adds them.
-    content = content.strip()
-
-    if content.startswith("```"):
-        content = re.sub(r"^```(?:json)?", "", content).strip()
-        content = re.sub(r"```$", "", content).strip()
-
+def safe_int(value: Any) -> Optional[int]:
     try:
-        return json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"Groq returned invalid JSON: {content[:300]}"
-        ) from exc
+        if value is None or isinstance(value, bool):
+            return None
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
-# =====================================
-# VALIDATE SCORES AND CALCULATE TOTAL
-# =====================================
+def nested(data: Any, *keys: str) -> Any:
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
 
-def calculate_score(analysis):
-    scores = analysis.get("scores") or {}
 
-    available_weight = 0
-    weighted_points = 0
-    verified_count = 0
-    missing_pillars = []
+def esc(value: Any) -> str:
+    return html.escape(str(value), quote=True)
 
-    clean_scores = {}
 
-    for pillar, weight in PILLARS.items():
-        item = scores.get(pillar) or {}
+def short_addr(address: str) -> str:
+    return f"{address[:6]}...{address[-6:]}" if len(address) > 14 else address
 
-        score = item.get("score")
-        evidence = str(item.get("evidence") or "Babu cikakkiyar hujja.")
-        evidence_type = str(item.get("type") or "Missing")
 
-        if evidence_type not in (
-            "Verified",
-            "AI Interpretation",
-            "Missing"
-        ):
-            evidence_type = "Missing"
+def money(value: Optional[float]) -> str:
+    value = safe_num(value)
+    if value is None:
+        return "N/A"
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    for divisor, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if value >= divisor:
+            return f"{sign}${value / divisor:.2f}{suffix}"
+    if value == 0:
+        return "$0"
+    if value < 0.0001:
+        return f"{sign}${value:.10f}".rstrip("0").rstrip(".")
+    if value < 1:
+        return f"{sign}${value:.8f}".rstrip("0").rstrip(".")
+    return f"{sign}${value:,.2f}"
 
-        # Missing evidence must never become zero.
-        if evidence_type == "Missing" or score is None:
-            score = None
-            evidence_type = "Missing"
-            missing_pillars.append(pillar)
 
-        else:
-            score = safe_float(score, -1)
+def pct(value: Optional[float]) -> str:
+    value = safe_num(value)
+    return "N/A" if value is None else f"{value:+.1f}%"
 
-            if score < 0 or score > 10:
-                score = None
-                evidence_type = "Missing"
-                missing_pillars.append(pillar)
 
-            else:
-                available_weight += weight
-                weighted_points += score * weight
+def age_text(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "N/A"
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{seconds // 86400}d"
 
-                if evidence_type == "Verified":
-                    verified_count += 1
 
-        clean_scores[pillar] = {
-            "score": score,
-            "weight": weight,
-            "evidence": evidence,
-            "type": evidence_type,
-        }
+def utc_text(timestamp: Optional[int]) -> str:
+    if not timestamp:
+        return "N/A"
+    return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%d %b %Y %H:%M UTC")
 
-    if available_weight > 0:
-        total_score = weighted_points / available_weight
-    else:
-        total_score = None
 
-    coverage = available_weight
+def fmt_count(value: Optional[int]) -> str:
+    return "N/A" if value is None else f"{value:,}"
 
-    # Confidence is based on evidence coverage.
-    # With DexScreener as the only source, High is not allowed.
-    if coverage < 60:
-        confidence = "Low"
-    else:
-        confidence = "Medium"
 
-    verified_negative = analysis.get(
-        "verified_negative_evidence"
-    ) or []
+def ratio_text(numerator: Optional[float], denominator: Optional[float]) -> str:
+    if numerator is None or denominator is None or denominator <= 0:
+        return "N/A"
+    return f"{numerator / denominator:.2f}x"
 
-    # Classification rules:
-    # Missing evidence is never a reason for RED.
-    if coverage < 60 or total_score is None:
-        classification = "NEED MORE DATA"
 
-    elif verified_negative and total_score < 5:
-        classification = "RED"
+# ------------------------------ DATABASE -------------------------------------
+def db_connect() -> sqlite3.Connection:
+    db = sqlite3.connect(DB_PATH, timeout=20)
+    db.execute("PRAGMA journal_mode=WAL")
+    return db
 
-    elif total_score >= 7.5 and coverage >= 75:
-        classification = "GREEN"
 
-    else:
-        classification = "YELLOW"
+def init_db() -> None:
+    with db_connect() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS first_seen (
+                mint TEXT PRIMARY KEY,
+                first_seen INTEGER NOT NULL,
+                first_price REAL,
+                first_mc REAL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mint TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                price REAL,
+                fdv REAL,
+                mc REAL
+            )
+        """)
+        # Add mc to older databases without destroying existing history.
+        columns = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
+        if "mc" not in columns:
+            db.execute("ALTER TABLE snapshots ADD COLUMN mc REAL")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_mint_ts ON snapshots(mint, ts)")
+
+
+def record_snapshot(mint: str, price: Optional[float], fdv: Optional[float], mc: Optional[float]) -> None:
+    now = int(time.time())
+    with db_connect() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO first_seen(mint, first_seen, first_price, first_mc) VALUES(?,?,?,?)",
+            (mint, now, price, mc if mc is not None else fdv),
+        )
+        db.execute(
+            "INSERT INTO snapshots(mint, ts, price, fdv, mc) VALUES(?,?,?,?,?)",
+            (mint, now, price, fdv, mc),
+        )
+        db.execute("DELETE FROM snapshots WHERE ts < ?", (now - 30 * 86400,))
+
+
+def tracking_data(mint: str) -> dict[str, Any]:
+    now = int(time.time())
+    with db_connect() as db:
+        first = db.execute(
+            "SELECT first_seen, first_price, first_mc FROM first_seen WHERE mint=?", (mint,)
+        ).fetchone()
+        ath = db.execute(
+            "SELECT MAX(price), MAX(fdv), MAX(mc) FROM snapshots WHERE mint=?", (mint,)
+        ).fetchone()
+        old = db.execute(
+            "SELECT price, fdv, mc, ts FROM snapshots WHERE mint=? AND ts<=? ORDER BY ts DESC LIMIT 1",
+            (mint, now - 23 * 3600),
+        ).fetchone()
+    return {"first": first, "ath_price": ath[0] if ath else None,
+            "ath_fdv": ath[1] if ath else None, "ath_mc": ath[2] if ath else None,
+            "old_24h": old}
+
+
+# ------------------------------ HTTP / API -----------------------------------
+async def request_json(method: str, url: str, **kwargs: Any) -> Any:
+    global _http
+    if _http is None:
+        raise RuntimeError("HTTP client is not initialized")
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = await _http.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            last_error = exc
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+    raise RuntimeError(f"API request failed: {last_error}")
+
+
+async def helius_rpc(method: str, params: Any) -> Any:
+    if not HELIUS_KEY:
+        return None
+    result = await request_json(
+        "POST", HELIUS_RPC_URL,
+        params={"api-key": HELIUS_KEY},
+        json={"jsonrpc": "2.0", "id": "jabir-runner", "method": method, "params": params},
+    )
+    if result.get("error"):
+        raise RuntimeError(str(result["error"]))
+    return result.get("result")
+
+
+async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
+    now = time.time()
+    cached = _cache.get(mint)
+    if cached and now - cached[0] < CACHE_TTL:
+        return cached[1]
+
+    payload = await request_json("GET", DEX_TOKEN_URL.format(mint))
+    pairs = payload.get("pairs") or []
+    solana_pairs = [p for p in pairs if isinstance(p, dict) and p.get("chainId") == "solana"]
+    # Do not silently scan a quote-token pair and mislabel its base token as the requested mint.
+    matching = [
+        p for p in solana_pairs
+        if str(nested(p, "baseToken", "address") or "").lower() == mint.lower()
+    ]
+    if not matching:
+        return None
+    best = max(matching, key=lambda p: safe_num(nested(p, "liquidity", "usd")) or 0.0)
+
+    if len(_cache) >= CACHE_MAX:
+        expired = [key for key, (stamp, _) in _cache.items() if now - stamp >= CACHE_TTL]
+        for key in expired:
+            _cache.pop(key, None)
+        if len(_cache) >= CACHE_MAX:
+            _cache.pop(next(iter(_cache)))
+    _cache[mint] = (now, best)
+    return best
+
+
+async def fetch_paid_status(mint: str) -> Optional[bool]:
+    try:
+        orders = await request_json("GET", DEX_ORDERS_URL.format(mint))
+        if not isinstance(orders, list):
+            return None
+        return any(
+            isinstance(order, dict) and order.get("status") == "approved"
+            for order in orders
+        )
+    except Exception as exc:
+        log.warning("Dex paid status unavailable for %s: %s", mint, exc)
+        return None
+
+
+async def fetch_supply(mint: str) -> Optional[dict[str, Any]]:
+    result = await helius_rpc("getTokenSupply", [mint, {"commitment": "confirmed"}])
+    if not result:
+        return None
+    value = result.get("value") or {}
+    raw = safe_int(value.get("amount"))
+    decimals = safe_int(value.get("decimals"))
+    if raw is None or decimals is None:
+        return None
+    return {"raw": raw, "decimals": decimals, "ui_amount": safe_num(value.get("uiAmount"))}
+
+
+async def fetch_authorities(mint: str) -> Optional[dict[str, Any]]:
+    result = await helius_rpc(
+        "getAccountInfo",
+        [mint, {"encoding": "base64", "commitment": "confirmed"}],
+    )
+    value = (result or {}).get("value")
+    if not value:
+        return None
+    account_data = value.get("data")
+    if not isinstance(account_data, list) or not account_data:
+        return None
+    try:
+        raw = base64.b64decode(account_data[0])
+    except Exception:
+        return None
+    # Standard SPL Token mint layout only. Token-2022 extension layouts are not fully decoded here.
+    if len(raw) < 82:
+        return None
+
+    def authority(option_offset: int, key_offset: int) -> Optional[str]:
+        option = int.from_bytes(raw[option_offset:option_offset + 4], "little")
+        return raw[key_offset:key_offset + 32].hex() if option == 1 else None
 
     return {
-        "scores": clean_scores,
-        "total_score": total_score,
-        "coverage": coverage,
-        "confidence": confidence,
-        "classification": classification,
-        "missing_pillars": missing_pillars,
-        "verified_negative": verified_negative,
-        "verified_count": verified_count,
+        "mint_authority_active": authority(0, 4) is not None,
+        "freeze_authority_active": authority(46, 50) is not None,
+        "token_program": value.get("owner"),
+        "layout": "standard SPL",
     }
 
 
-# =====================================
-# REPORT FORMATTING
-# =====================================
+async def fetch_holders(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
+    if not HELIUS_KEY or supply_raw <= 0:
+        return None
+    cursor = None
+    all_accounts: list[dict[str, Any]] = []
+    reported_total = None
 
-def format_report(market, analysis):
-    result = calculate_score(analysis)
+    for page in range(MAX_HOLDER_PAGES):
+        params: dict[str, Any] = {
+            "mint": mint, "limit": HOLDER_PAGE_SIZE,
+            "options": {"showZeroBalance": False},
+        }
+        if cursor:
+            params["cursor"] = cursor
+        result = await helius_rpc("getTokenAccounts", params)
+        if not result:
+            break
+        if reported_total is None:
+            reported_total = safe_int(result.get("total"))
+        accounts = result.get("token_accounts") or []
+        all_accounts.extend(a for a in accounts if isinstance(a, dict))
+        cursor = result.get("cursor")
+        if not cursor or not accounts:
+            break
 
-    name = market["name"]
-    ticker = market["ticker"]
-    chain = market["chain"]
-    dex = market["dex"]
+    if not all_accounts:
+        return None
 
-    price = format_price(market["price_usd"])
-    liquidity = format_money(market["liquidity_usd"])
-    volume = format_money(market["volume_24h_usd"])
-    fdv = format_money(market["fdv_usd"])
+    # Exact integer aggregation avoids float precision loss in raw token amounts.
+    owner_amounts: dict[str, int] = {}
+    for account in all_accounts:
+        owner = account.get("owner")
+        amount = safe_int(account.get("amount"))
+        if owner and amount and amount > 0:
+            owner_amounts[owner] = owner_amounts.get(owner, 0) + amount
 
-    change = market["price_change_24h"]
-    change_text = f"{change:+.2f}%"
+    ranked = sorted(owner_amounts.items(), key=lambda item: item[1], reverse=True)
+    complete = reported_total is not None and len(all_accounts) >= reported_total
+    top10 = (sum(amount for _, amount in ranked[:10]) / supply_raw * 100) if complete else None
+    top_five = [f"{amount / supply_raw * 100:.1f}%" for _, amount in ranked[:5]]
+    return {
+        "holder_count": len(owner_amounts) if complete else None,
+        "top10_percent": top10,
+        "top_five": top_five,
+        "complete": complete,
+        "accounts_scanned": len(all_accounts),
+        "reported_accounts": reported_total,
+    }
 
-    buys = market["buys_24h"]
-    sells = market["sells_24h"]
 
-    total_score = result["total_score"]
+def socials_from_pair(pair: dict[str, Any]) -> dict[str, bool]:
+    info = pair.get("info") or {}
+    websites = [x for x in (info.get("websites") or []) if isinstance(x, dict)]
+    socials = [x for x in (info.get("socials") or []) if isinstance(x, dict)]
+    all_text = [
+        " ".join(str(x.get(k, "")) for k in ("type", "platform", "url", "handle")).lower()
+        for x in socials
+    ]
+    x_found = any("twitter" in x or "x.com" in x for x in all_text)
+    tg_found = any("telegram" in x or "t.me" in x for x in all_text)
+    web_found = bool(websites)
+    return {"x": x_found, "web": web_found, "tg": tg_found}
 
-    if total_score is None:
-        score_text = "N/A"
+
+async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
+    pair = await fetch_pair(mint)
+    if not pair:
+        raise ValueError("Ba a samu Solana pair da mint ɗin yake base token ba.")
+
+    base = pair.get("baseToken") or {}
+    volume = pair.get("volume") or {}
+    changes = pair.get("priceChange") or {}
+    txns = pair.get("txns") or {}
+    h1, h24 = txns.get("h1") or {}, txns.get("h24") or {}
+
+    price = safe_num(pair.get("priceUsd"))
+    fdv = safe_num(pair.get("fdv"))
+    mc = safe_num(pair.get("marketCap"))
+    liq = safe_num(nested(pair, "liquidity", "usd"))
+    created_ms = safe_num(pair.get("pairCreatedAt"))
+    created_ts = created_ms / 1000 if created_ms else None
+    now = time.time()
+    age_sec = now - created_ts if created_ts else None
+
+    # Track only values actually observed by this bot. ATH is since first scan, not lifetime ATH.
+    await asyncio.to_thread(record_snapshot, mint, price, fdv, mc)
+    tracking = await asyncio.to_thread(tracking_data, mint)
+    old = tracking.get("old_24h")
+    fdv_change_24h = None
+    if old and old[1] and fdv is not None and old[1] > 0:
+        fdv_change_24h = (fdv / old[1] - 1) * 100
+
+    socials = socials_from_pair(pair)
+    # Market scan always gets paid status; deep scan also requests on-chain detail.
+    paid_task = fetch_paid_status(mint)
+    supply_task = fetch_supply(mint) if HELIUS_KEY else asyncio.sleep(0, result=None)
+    authorities_task = fetch_authorities(mint) if HELIUS_KEY else asyncio.sleep(0, result=None)
+    paid, supply, authorities = await asyncio.gather(
+        paid_task, supply_task, authorities_task, return_exceptions=True
+    )
+    if isinstance(paid, Exception):
+        log.warning("Paid lookup failed: %s", paid)
+        paid = None
+    if isinstance(supply, Exception):
+        log.warning("Supply lookup failed: %s", supply)
+        supply = None
+    if isinstance(authorities, Exception):
+        log.warning("Authority lookup failed: %s", authorities)
+        authorities = None
+
+    holders = None
+    if deep and supply:
+        try:
+            holders = await fetch_holders(mint, supply["raw"])
+        except Exception as exc:
+            log.warning("Holder lookup failed: %s", exc)
+
+    first = tracking.get("first")
+    ath_price = tracking.get("ath_price")
+    ath_distance = ((price / ath_price) - 1) * 100 if price and ath_price and ath_price > 0 else None
+
+    return {
+        "mint": mint,
+        "name": base.get("name") or "Unknown",
+        "symbol": base.get("symbol") or "?",
+        "price": price, "liquidity": liq,
+        "volume24": safe_num(volume.get("h24")),
+        "fdv": fdv, "mc": mc,
+        "price_change_1h": safe_num(changes.get("h1")),
+        "price_change_24h": safe_num(changes.get("h24")),
+        "buys1h": safe_int(h1.get("buys")), "sells1h": safe_int(h1.get("sells")),
+        "buys24": safe_int(h24.get("buys")), "sells24": safe_int(h24.get("sells")),
+        "dex": pair.get("dexId") or "N/A",
+        "pair": pair.get("pairAddress"),
+        "url": pair.get("url") or f"https://dexscreener.com/solana/{mint}",
+        "created_ts": created_ts, "age_sec": age_sec,
+        "ath_price": ath_price, "ath_distance": ath_distance,
+        "fdv_change_24h": fdv_change_24h,
+        "supply": supply, "authorities": authorities, "holders": holders,
+        "socials": socials, "dex_paid": paid,
+        "first_seen": first[0] if first else None,
+        "first_price": first[1] if first else None,
+        "first_mc": first[2] if first else None,
+        "pair_data": pair,
+    }
+
+
+# ------------------------------ RISK / NARRATIVE ------------------------------
+def buy_ratio(data: dict[str, Any]) -> Optional[float]:
+    buys, sells = data.get("buys24"), data.get("sells24")
+    if buys is None or sells is None or buys + sells <= 0:
+        return None
+    return buys / (buys + sells)
+
+
+def market_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
+    flags: list[tuple[str, str]] = []
+    liq, vol = data.get("liquidity"), data.get("volume24")
+    mc = data.get("mc") or data.get("fdv")
+    age = data.get("age_sec")
+    if liq is not None and liq < 10_000:
+        flags.append(("HIGH", "Liquidity below $10K"))
+    if liq is not None and mc and mc >= 100_000 and liq / mc < 0.02:
+        flags.append(("HIGH", f"LP/MC very thin ({liq / mc * 100:.1f}%)"))
+    elif liq is not None and mc and mc >= 100_000 and liq / mc < 0.05:
+        flags.append(("MEDIUM", f"LP/MC thin ({liq / mc * 100:.1f}%)"))
+    if age is not None and age < 3600:
+        flags.append(("MEDIUM", "Pair younger than 1 hour"))
+    if vol is not None and mc and vol > mc * 5:
+        flags.append(("MEDIUM", "24h volume exceeds 5x MC; verify wash-trading risk"))
+    if vol is not None and data.get("fdv") and data["fdv"] > 0 and vol < data["fdv"] * 0.01:
+        flags.append(("MEDIUM", "Volume is thin versus FDV"))
+    ratio = buy_ratio(data)
+    tx_total = (data.get("buys24") or 0) + (data.get("sells24") or 0)
+    if ratio is not None and tx_total >= 100 and ratio < 0.40:
+        flags.append(("MEDIUM", "Heavy sell pressure"))
+    return flags
+
+
+def security_assessment(data: dict[str, Any]) -> dict[str, Any]:
+    authorities = data.get("authorities") or {}
+    holders = data.get("holders") or {}
+    flags: list[str] = []
+    if authorities.get("mint_authority_active") is True:
+        flags.append("Mint authority active")
+    if authorities.get("freeze_authority_active") is True:
+        flags.append("Freeze authority active")
+    top10 = holders.get("top10_percent")
+    if top10 is not None and top10 >= 50:
+        flags.append(f"Top 10 wallets hold {top10:.1f}% (partial holder data checked)")
+    # Bundle/dev/sniper/fake-holder metrics are not computed by this code.
+    # Do not present them as zero or claim those risks were cleared.
+    if flags:
+        level = "HIGH"
+    elif not authorities or (data.get("holders") is None):
+        level = "UNKNOWN"
     else:
-        score_text = f"{total_score:.2f}/10"
+        level = "UNASSESSED"
+    return {"level": level, "flags": flags}
 
-    classification = result["classification"]
 
-    if classification == "GREEN":
-        class_icon = "🟢"
-    elif classification == "RED":
-        class_icon = "🔴"
-    else:
-        class_icon = "🟡"
+def verdict(data: dict[str, Any]) -> tuple[str, str]:
+    liq, vol = data.get("liquidity"), data.get("volume24")
+    mc = data.get("mc") or data.get("fdv")
+    chg, age = data.get("price_change_24h"), data.get("age_sec")
+    flags = market_flags(data)
+    security = security_assessment(data)
+
+    if liq is not None and mc is not None and liq < 10_000 and mc > 100_000:
+        return "🔴 AVOID", "Low liquidity relative to valuation"
+    if any(level == "HIGH" for level, _ in flags) or security["level"] == "HIGH":
+        return "🟡 WATCH", "High-risk warning detected; inspect the flags"
+    if age is not None and age < 3600 and vol is not None and mc and vol > mc * 2:
+        return "🟡 WATCH", "Very new pair with unusually high volume"
+    if chg is not None and chg > 100 and liq is not None and vol is not None and vol > liq:
+        return "🟡 WATCH", "Potentially overheated; wait for confirmation"
+    # No BUY verdict: security attribution and a validated entry strategy are not implemented.
+    missing = []
+    if not HELIUS_KEY:
+        missing.append("Helius key missing")
+    if security["level"] == "UNKNOWN":
+        missing.append("on-chain checks incomplete")
+    if data.get("buys24") is None or data.get("sells24") is None:
+        missing.append("transaction data incomplete")
+    reason = "No automatic BUY signal. " + (", ".join(missing) if missing else "Use a separately tested strategy.")
+    return "🟡 WATCH", reason
+
+
+async def groq_narrative(data: dict[str, Any]) -> str:
+    if not GROQ_KEY:
+        return "AI narrative: N/A (GROQ_API_KEY missing)"
+    prompt_data = {
+        "name": data["name"], "ticker": data["symbol"], "dex": data["dex"],
+        "pair_age": age_text(data["age_sec"]),
+        "price_change_1h": data["price_change_1h"],
+        "price_change_24h": data["price_change_24h"],
+        "liquidity_usd": data["liquidity"], "volume_24h_usd": data["volume24"],
+        "social_links_present": data["socials"],
+    }
+    prompt = (
+        "Write exactly two short lines in natural Hausa. First: describe only what "
+        "the supplied token name/symbol and links suggest, and clearly say if the "
+        "project identity is not verified. Second: summarize market attention or "
+        "weak evidence from the supplied figures. Do not invent utility, team, "
+        "partnerships, community, news, followers, or adoption. Do not advise buying "
+        "or selling. Data: " + json.dumps(prompt_data, ensure_ascii=False)
+    )
+    try:
+        result = await request_json(
+            "POST", GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": "Return only two concise Hausa lines. No unsupported claims."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2, "max_tokens": 130,
+            },
+        )
+        content = result["choices"][0]["message"]["content"].strip()
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        return "\n".join(lines[:2]) if lines else "AI narrative: N/A"
+    except Exception as exc:
+        log.warning("Groq narrative failed: %s", exc)
+        return "AI narrative: N/A (Groq request failed)"
+
+
+# ------------------------------ REPORT / UI ----------------------------------
+def yes_no(value: Optional[bool]) -> str:
+    return "✅" if value is True else "❌" if value is False else "N/A"
+
+
+def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
+    security = security_assessment(data)
+    market = market_flags(data)
+    verdict_text, verdict_reason = verdict(data)
+    supply = data.get("supply") or {}
+    holders = data.get("holders") or {}
+    authorities = data.get("authorities") or {}
+    socials = data["socials"]
+
+    mc_value = data.get("mc")
+    mc_text = money(mc_value) if mc_value is not None else (
+        f"N/A (FDV {money(data.get('fdv'))})" if data.get("fdv") is not None else "N/A"
+    )
+    ath_text = "N/A (tracked since bot's first scan)"
+    if data.get("ath_price") is not None and data.get("ath_distance") is not None:
+        ath_text = f"{money(data['ath_price'])} ({data['ath_distance']:+.1f}% from tracked high)"
+    top10 = holders.get("top10_percent")
+    top10_text = f"{top10:.1f}%" if top10 is not None else "N/A"
+    holder_count = holders.get("holder_count")
+    top_five = "|".join(holders.get("top_five") or []) or "N/A"
+
+    mint_auth = "ACTIVE" if authorities.get("mint_authority_active") is True else (
+        "REVOKED" if authorities and authorities.get("mint_authority_active") is False else "N/A"
+    )
+    freeze_auth = "ACTIVE" if authorities.get("freeze_authority_active") is True else (
+        "REVOKED" if authorities and authorities.get("freeze_authority_active") is False else "N/A"
+    )
+    paid_text = yes_no(data.get("dex_paid"))
+    market_text = "; ".join(text for _, text in market[:3]) if market else "No market flags detected"
+    security_text = "; ".join(security["flags"]) if security["flags"] else (
+        "No authority/holder flag detected; bundle/dev/sniper checks unavailable"
+    )
+
+    pair = data.get("pair") or data["mint"]
+    chart_url = f"https://dexscreener.com/solana/{pair}"
+    photon_url = f"https://photon-sol.tinyastro.io/en/lp/{pair}"
+    solscan_url = f"https://solscan.io/token/{data['mint']}"
+    dex_url = data.get("url") or chart_url
 
     lines = [
-        "🚀 JABIR RUNNER REPORT",
-        "━━━━━━━━━━━━━━━━━━━━",
+        f"🚀 <b>JABIR RUNNER V2</b> | ${esc(data['symbol'])}",
+        BAR,
+        f"🪙 {esc(data['name'])} | {esc(data['dex'])} | 🌱 {age_text(data['age_sec'])}",
+        f"📍 CA: <code>{esc(short_addr(data['mint']))}</code>",
         "",
-        f"🪙 {name} (${ticker})",
-        f"⛓️ Chain: {chain}",
-        f"📍 DEX: {dex}",
+        "<b>📊 MARKET</b>",
+        f"💰 {money(data['price'])} ({pct(data['price_change_24h'])}) | MC: {mc_text}",
+        f"🏔️ ATH: {ath_text}",
+        f"💧 LP: {money(data['liquidity'])} | Vol 24h: {money(data['volume24'])} | Vol/LP: {ratio_text(data['volume24'], data['liquidity'])}",
+        f"⏱️ 1H: {pct(data['price_change_1h'])} | Buys: {fmt_count(data['buys1h'])} | Sells: {fmt_count(data['sells1h'])}",
+        f"⚡ FDV: {money(data['fdv'])} | Supply: {fmt_count(safe_int(supply.get('ui_amount')))}",
         "",
-        "📊 MARKET SNAPSHOT",
-        f"💵 Price: {price}",
-        f"💧 Liquidity: {liquidity} USD",
-        f"📈 Volume 24h: {volume} USD",
-        f"🏷️ FDV: {fdv}",
-        f"🔄 Price Change 24h: {change_text}",
-        f"🟢 Buys: {buys} | 🔴 Sells: {sells}",
+        f"<b>🧠 NARRATIVE</b>\n{esc(narrative)}",
         "",
-        "🧠 NARRATIVE INTELLIGENCE",
-        str(analysis.get("narrative") or "Ba a samu cikakken bayani ba."),
+        "<b>🔒 SECURITY</b>",
+        f"├ Mint: {mint_auth} | Freeze: {freeze_auth} | DEX Paid: {paid_text}",
+        f"├ Top 10: {top10_text} | Holders: {fmt_count(holder_count)}",
+        f"├ Top wallets: {esc(top_five)}",
+        f"└ Bundle/Dev/Snipers/Fake holders: N/A (not attributed)",
         "",
-        "👥 AUDIENCE",
-        str(analysis.get("audience") or "Unverified"),
-        "",
-        "🌍 CULTURAL RELEVANCE",
-        str(analysis.get("cultural_relevance") or "Unverified"),
-        "",
-        "🏷️ BRAND CONNECTION",
-        str(analysis.get("brand_connection") or "Unverified"),
-        "",
-        "⚖️ PILLAR SCORES",
-        "",
+        f"<b>⚠️ MARKET RISK:</b> {esc(market_text)}",
+        f"<b>🛡️ ON-CHAIN:</b> {esc(security['level'])} - {esc(security_text)}",
+        f"<b>🎯 VERDICT:</b> {verdict_text} - {esc(verdict_reason)}",
+        f"🕒 First scan: {utc_text(data.get('first_seen'))} | ATH is bot-tracked only",
+        f"🔗 <a href=\"{esc(chart_url)}\">Chart</a> | <a href=\"{esc(dex_url)}\">DexScreener</a> | <a href=\"{esc(photon_url)}\">Photon</a> | <a href=\"{esc(solscan_url)}\">Solscan</a>",
+        BAR,
+        "<i>JABIR RUNNER | See Beyond The Chart.</i>",
     ]
-
-    for pillar, item in result["scores"].items():
-        score = item["score"]
-        weight = item["weight"]
-
-        if score is None:
-            score_text_pillar = "N/A"
-        else:
-            score_text_pillar = f"{score:.1f}/10"
-
-        lines.extend([
-            f"• {pillar}: {score_text_pillar} ({weight}%)",
-            f"  Evidence: {item['evidence']}",
-            f"  Type: {item['type']}",
-            "",
-        ])
-
-    lines.extend([
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"📊 WEIGHTED SCORE: {score_text}",
-        f"📡 DATA COVERAGE: {result['coverage']}%",
-        f"{class_icon} CLASSIFICATION: {classification}",
-        f"🎯 CONFIDENCE: {result['confidence']}",
-        "",
-        "📚 CATALYSTS",
-    ])
-
-    catalysts = analysis.get("catalysts") or []
-
-    if catalysts:
-        for catalyst in catalysts[:5]:
-            if isinstance(catalyst, dict):
-                item = catalyst.get("item", "Unknown")
-                evidence = catalyst.get("evidence", "")
-                evidence_type = catalyst.get("type", "Unverified")
-
-                lines.append(f"• {item}")
-                if evidence:
-                    lines.append(f"  Evidence: {evidence}")
-                lines.append(f"  Type: {evidence_type}")
-            else:
-                lines.append(f"• {catalyst}")
-    else:
-        lines.append("• Babu verified catalyst a cikin bayanan da aka bayar.")
-
-    lines.extend([
-        "",
-        "⏳ NARRATIVE LIFESPAN",
-    ])
-
-    lifespan = analysis.get("lifespan") or {}
-
-    lines.append(
-        f"Estimate: {lifespan.get('estimate', 'Uncertain')}"
-    )
-    lines.append(
-        str(lifespan.get('reason') or "Babu isasshen tarihi.")
-    )
-
-    lines.extend([
-        "",
-        "⚠️ TOP RISKS",
-    ])
-
-    risks = analysis.get("risks") or []
-
-    if risks:
-        for index, risk in enumerate(risks[:3], start=1):
-            if isinstance(risk, dict):
-                item = risk.get("item", "Unspecified risk")
-                risk_type = risk.get("type", "Unverified")
-                lines.append(f"{index}. {item} ({risk_type})")
-            else:
-                lines.append(f"{index}. {risk}")
-    else:
-        lines.append("1. Ba a samu cikakken bayanin haɗari ba.")
-
-    lines.extend([
-        "",
-        "🔎 UNVERIFIED ITEMS",
-    ])
-
-    unverified = analysis.get("unverified_items") or []
-
-    # Always include missing pillars.
-    for pillar in result["missing_pillars"]:
-        label = f"{pillar}: babu isasshiyar hujja"
-
-        if label not in unverified:
-            unverified.append(label)
-
-    if unverified:
-        for item in unverified[:10]:
-            lines.append(f"• {item}")
-    else:
-        lines.append("• Babu ƙarin abubuwan da aka jera.")
-
-    if result["verified_negative"]:
-        lines.extend([
-            "",
-            "🚨 VERIFIED NEGATIVE EVIDENCE",
-        ])
-
-        for item in result["verified_negative"][:5]:
-            lines.append(f"• {item}")
-
-    lines.extend([
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "📌 DATA LIMITATION",
-        str(
-            analysis.get("limitations")
-            or "Binciken ya dogara da bayanan DexScreener."
-        ),
-        "",
-        "DexScreener data ba ya tabbatar da social activity, "
-        "holders, dev wallets ko contract security.",
-        "",
-        "⚠️ Kada ka yanke shawarar siye ko sayarwa bisa "
-        "wannan report kawai.",
-        "",
-    ])
-
-    humor = analysis.get("humor")
-
-    if humor:
-        lines.extend([
-            "😄 RUNNER'S CORNER",
-            str(humor),
-            "",
-        ])
-
-    lines.extend([
-        f"🔗 DexScreener: {market['url']}",
-        "",
-        "JABIR RUNNER | See Beyond The Chart.",
-    ])
-
     return "\n".join(lines)
 
 
-# =====================================
-# TELEGRAM REPORT SENDER
-# =====================================
-
-def split_message(text, limit=3900):
-    chunks = []
-    current = ""
-
-    for line in text.split("\n"):
-        if len(current) + len(line) + 1 > limit:
-            if current:
-                chunks.append(current)
-            current = line
-        else:
-            current += ("\n" if current else "") + line
-
-    if current:
-        chunks.append(current)
-
-    return chunks
+def report_keyboard(mint: str, pair_url: str, pair_address: Optional[str]) -> InlineKeyboardMarkup:
+    pair_address = pair_address or mint
+    photon = f"https://photon-sol.tinyastro.io/en/lp/{pair_address}"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{mint}"),
+            InlineKeyboardButton("📈 Chart", url=pair_url),
+            InlineKeyboardButton("🛡️ Deep Scan", callback_data=f"deep:{mint}"),
+        ],
+        [
+            InlineKeyboardButton("DexScreener", url=pair_url),
+            InlineKeyboardButton("Photon", url=photon),
+            InlineKeyboardButton("Solscan", url=f"https://solscan.io/token/{mint}"),
+        ],
+    ])
 
 
-async def send_report(status, report, context):
-    chunks = split_message(report)
-
-    await status.edit_text(
-        chunks[0],
-        disable_web_page_preview=True
-    )
-
-    for chunk in chunks[1:]:
-        await context.bot.send_message(
-            chat_id=status.chat_id,
-            text=chunk,
-            disable_web_page_preview=True
-        )
-
-
-# =====================================
-# CONTRACT ADDRESS HANDLER
-# =====================================
-
-async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+# ------------------------------ TELEGRAM -------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
         return
-
-    message_text = update.message.text.strip()
-
-    ca_match = re.search(
-        r"(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})",
-        message_text
+    await update.message.reply_text(
+        "🚀 <b>JABIR RUNNER V2</b>\n"
+        "<i>See Beyond The Chart.</i>\n\n"
+        "Turo Solana token Contract Address (CA) domin scan.\n\n"
+        "Quick tests: /testicles /pengu /grokius\n"
+        "Commands: /help",
+        parse_mode=ParseMode.HTML,
     )
 
-    if not ca_match:
-        await update.message.reply_text(
-            "❌ Ban gane CA ba.\n\n"
-            "Ka turo Contract Address kawai."
-        )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
         return
-
-    ca = ca_match.group(1)
-
-    status = await update.message.reply_text(
-        "🔍 JABIR RUNNER SCANNER\n\n"
-        "✅ An karɓi Contract Address.\n"
-        "⏳ Ina ɗauko bayanan DexScreener..."
+    await update.message.reply_text(
+        "📖 <b>JABIR RUNNER V2 GUIDE</b>\n\n"
+        "• Turo Solana CA domin scan.\n"
+        "• /testicles, /pengu, /grokius domin gwaji.\n"
+        "• Refresh yana sabunta market data.\n"
+        "• Deep Scan yana ƙoƙarin karanta holder data ta Helius.\n\n"
+        "Muhimmi:\n"
+        "• ATH yana farawa daga lokacin da bot ya fara tracking.\n"
+        "• Bundle/dev/sniper/fake-holder attribution bai gama ginawa ba, don haka N/A ne.\n"
+        "• Ba a fitar da automatic BUY signal. WATCH ba yana nufin token lafiya ba.\n"
+        "• Helius da Groq suna buƙatar API keys nasu.",
+        parse_mode=ParseMode.HTML,
     )
 
-    # FETCH DEXSCREENER DATA
 
+async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE,
+                       status_message=None, chat_id: Optional[int] = None,
+                       deep: bool = False) -> None:
     try:
-        pair = await asyncio.to_thread(
-            get_dex_data,
-            ca
-        )
+        if status_message:
+            await status_message.edit_text("🔍 JABIR RUNNER\n\n⏳ Fetching market data...")
+        data = await collect_token_data(mint, deep=deep)
+        if status_message:
+            await status_message.edit_text("🧠 Preparing trader report...")
+        narrative = await groq_narrative(data)
+        report = build_report(data, narrative, deep)
+        keyboard = report_keyboard(mint, data["url"], data.get("pair"))
+        if status_message:
+            await status_message.edit_text(
+                report, parse_mode=ParseMode.HTML,
+                reply_markup=keyboard, disable_web_page_preview=True,
+            )
+        elif chat_id is not None:
+            await context.bot.send_message(
+                chat_id, report, parse_mode=ParseMode.HTML,
+                reply_markup=keyboard, disable_web_page_preview=True,
+            )
+    except ValueError as exc:
+        message = f"❌ {esc(exc)}"
+        if status_message:
+            await status_message.edit_text(message, parse_mode=ParseMode.HTML)
+        elif chat_id is not None:
+            await context.bot.send_message(chat_id, message, parse_mode=ParseMode.HTML)
+    except Exception:
+        log.exception("Scan failed for %s", mint)
+        message = "❌ Scan failed. Duba Render Logs da API keys/configuration."
+        try:
+            if status_message:
+                await status_message.edit_text(message)
+            elif chat_id is not None:
+                await context.bot.send_message(chat_id, message)
+        except Exception:
+            log.exception("Could not send scan failure message")
 
-    except Exception as error:
-        print(f"DexScreener Error: {error}")
 
-        await status.edit_text(
-            "❌ SCAN FAILED\n\n"
-            "An samu matsala wajen haɗuwa da DexScreener.\n"
-            "Ka sake gwadawa daga baya."
-        )
+async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.text:
         return
-
-    if not pair:
-        await status.edit_text(
-            "❌ TOKEN NOT FOUND\n\n"
-            "Ban samu token ɗin a DexScreener ba.\n"
-            "Ka tabbatar CA ɗin daidai ne."
-        )
+    match = SOL_ADDR_RE.search(message.text.strip())
+    if not match:
         return
+    mint = match.group(0)
+    try:
+        await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
+    except Exception:
+        pass
+    status = await message.reply_text("🔍 JABIR RUNNER\n\nAn karɓi CA. Ana fara scan...")
+    await perform_scan(mint, context, status_message=status, deep=False)
 
-    # EXTRACT MARKET DATA
 
-    market = extract_market_data(ca, pair)
+async def preset_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+    if not update.message:
+        return
+    status = await update.message.reply_text(f"🔍 Starting {key.upper()} scan...")
+    await perform_scan(TEST_TOKENS[key], context, status_message=status, deep=False)
 
-    await status.edit_text(
-        "🧠 JABIR RUNNER NARRATIVE ENGINE\n\n"
-        "✅ DexScreener data received.\n"
-        "⏳ Groq AI na nazarin narrative..."
+
+async def testicles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await preset_scan(update, context, "testicles")
+
+
+async def pengu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await preset_scan(update, context, "pengu")
+
+
+async def grokius_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await preset_scan(update, context, "grokius")
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    raw = query.data or ""
+    if ":" not in raw:
+        return
+    action, mint = raw.split(":", 1)
+    if action not in ("refresh", "deep") or not SOL_ADDR_RE.fullmatch(mint):
+        return
+    await perform_scan(
+        mint, context, status_message=query.message,
+        deep=(action == "deep"),
     )
 
-    # GROQ ANALYSIS
 
-    try:
-        analysis = await asyncio.to_thread(
-            analyze_with_groq,
-            market
-        )
-
-        report = format_report(
-            market,
-            analysis
-        )
-
-        await send_report(
-            status,
-            report,
-            context
-        )
-
-    except Exception as error:
-        print(f"Groq Analysis Error: {error}")
-
-        fallback = (
-            "🚀 JABIR RUNNER REPORT\n\n"
-            f"{market['name']} (${market['ticker']})\n"
-            f"Chain: {market['chain']}\n"
-            f"DEX: {market['dex']}\n\n"
-            f"Price: {format_price(market['price_usd'])}\n"
-            f"Liquidity: {format_money(market['liquidity_usd'])} USD\n"
-            f"Volume 24h: {format_money(market['volume_24h_usd'])} USD\n"
-            f"FDV: {format_money(market['fdv_usd'])}\n\n"
-            "⚠️ AI Narrative Analysis bai samu nasara ba.\n"
-            "Ka duba Render Logs domin ganin ainihin kuskuren.\n\n"
-            f"DexScreener: {market['url']}"
-        )
-
-        await status.edit_text(
-            fallback,
-            disable_web_page_preview=True
-        )
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Unhandled Telegram error: %s", context.error)
 
 
-# =====================================
-# START BOT
-# =====================================
+async def post_init(application: Application) -> None:
+    global _http
+    _http = httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0, connect=10.0),
+        headers={"User-Agent": "JABIR-RUNNER/2.0"},
+        limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),
+    )
+    await asyncio.to_thread(init_db)
+    log.info("JABIR RUNNER V2 initialized")
 
-if __name__ == "__main__":
 
-    if not TOKEN:
-        raise ValueError("TELEGRAM_TOKEN is missing!")
+async def post_shutdown(application: Application) -> None:
+    global _http
+    if _http:
+        await _http.aclose()
+        _http = None
 
-    if not GROQ_KEY:
-        raise ValueError("GROQ_API_KEY is missing!")
 
+def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("Missing TELEGRAM_TOKEN or BOT_TOKEN")
     if not RENDER_URL:
-        raise ValueError("RENDER_EXTERNAL_URL is missing!")
-
+        raise SystemExit("Missing RENDER_EXTERNAL_URL")
     if not WEBHOOK_SECRET:
-        raise ValueError("WEBHOOK_SECRET is missing!")
+        raise SystemExit("Missing WEBHOOK_SECRET")
 
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(
-        CommandHandler("start", start)
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
     )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("testicles", testicles_cmd))
+    app.add_handler(CommandHandler("pengu", pengu_cmd))
+    app.add_handler(CommandHandler("grokius", grokius_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ca))
+    app.add_error_handler(error_handler)
 
-    app.add_handler(
-        CommandHandler("help", help_cmd)
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_ca
-        )
-    )
-
-    print("JABIR RUNNER starting with Webhook...")
-
+    log.info("JABIR RUNNER V2 starting webhook")
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=WEBHOOK_PATH,
-        webhook_url=f"{RENDER_URL.rstrip('/')}/{WEBHOOK_PATH}",
+        webhook_url=f"{RENDER_URL}/{WEBHOOK_PATH}",
         secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=False,
+        drop_pending_updates=True,
         bootstrap_retries=-1,
     )
+
+
+if __name__ == "__main__":
+    main()
