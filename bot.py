@@ -62,7 +62,9 @@ HOLDER_PAGE_SIZE = 1000
 DEX_MIN_INTERVAL = 1.2      # minimum seconds between ANY two DexScreener requests
 DEX_MAX_ATTEMPTS = 5        # attempts per call (429, 5xx and network errors are retried)
 DEX_BACKOFF_BASE = 2.0      # exponential backoff base, seconds
-DEX_MAX_WAIT = 20.0         # never wait longer than this between attempts
+DEX_MAX_BACKOFF = 20.0      # cap for exponential backoff waits (no Retry-After header)
+DEX_MAX_RETRY_AFTER = 60.0  # honor Retry-After up to this many seconds; longer -> give up
+DEX_TOTAL_DEADLINE = 100.0  # one DexScreener call never takes longer than this in total
 
 TEST_TOKENS = {
     "testicles": "3pGmCpDCr2B6cZFhFJFtLrcMCadMvjV4dB9UGJyNpump",
@@ -76,6 +78,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+for _noisy in ("httpx", "httpcore"):
+    # httpx logs full request URLs at INFO level, which contain the Telegram bot token and Helius API key
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("jabir_runner")
 _http: Optional[httpx.AsyncClient] = None
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -307,16 +312,19 @@ def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
         return None
 
 def _dex_backoff(attempt: int) -> float:
-    """Exponential backoff with jitter, capped at DEX_MAX_WAIT."""
-    return min(DEX_MAX_WAIT, DEX_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0.0, 1.0))
+    """Exponential backoff with jitter, capped at DEX_MAX_BACKOFF."""
+    return min(DEX_MAX_BACKOFF, DEX_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0.0, 1.0))
 
-async def dex_get_json(url: str) -> Any:
+async def dex_get_json(
+    url: str, *, max_attempts: int = DEX_MAX_ATTEMPTS, max_retry_after: float = DEX_MAX_RETRY_AFTER,
+) -> Any:
     """
     The ONLY way the bot talks to DexScreener (token AND orders endpoints).
     - One request at a time (semaphore wraps the whole request + retry loop)
     - At least DEX_MIN_INTERVAL seconds between requests
-    - Up to DEX_MAX_ATTEMPTS attempts for 429, 5xx, network errors, bad JSON
-    - 429: honors Retry-After, otherwise exponential backoff + jitter
+    - Up to max_attempts attempts for 429, 5xx, network errors, bad JSON
+    - 429: honors Retry-After (up to max_retry_after), otherwise exponential backoff + jitter
+    - Gives up when the total time would pass DEX_TOTAL_DEADLINE
     - Other 4xx (404, 400...) are permanent: raised immediately, no retry
     """
     global _dex_last_request
@@ -324,9 +332,10 @@ async def dex_get_json(url: str) -> Any:
         raise RuntimeError("HTTP client is not initialized")
 
     async with _get_dex_semaphore():
+        started = time.monotonic()
         problem = "unknown error"
         was_rate_limited = False
-        for attempt in range(1, DEX_MAX_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
             gap = DEX_MIN_INTERVAL - (time.monotonic() - _dex_last_request)
             if gap > 0:
                 await asyncio.sleep(gap)
@@ -346,10 +355,10 @@ async def dex_get_json(url: str) -> Any:
                     problem = "HTTP 429 Too Many Requests"
                     retry_after = _retry_after_seconds(response)
                     if retry_after is not None:
-                        if retry_after > DEX_MAX_WAIT:
+                        if retry_after > max_retry_after:
                             raise DexRateLimited(
                                 f"HTTP 429, Retry-After {retry_after:.0f}s is above the "
-                                f"{DEX_MAX_WAIT:.0f}s limit"
+                                f"{max_retry_after:.0f}s limit"
                             )
                         wait = retry_after + random.uniform(0.0, 0.5)
                 elif status >= 500:
@@ -362,15 +371,18 @@ async def dex_get_json(url: str) -> Any:
                     except ValueError:
                         problem = "invalid JSON in response"
 
-            if attempt >= DEX_MAX_ATTEMPTS:
+            if attempt >= max_attempts:
+                break
+            if time.monotonic() - started + wait > DEX_TOTAL_DEADLINE:
+                problem += f" (total wait limit {DEX_TOTAL_DEADLINE:.0f}s reached)"
                 break
             log.warning(
                 "DexScreener %s (attempt %d/%d) - retrying in %.1fs",
-                problem, attempt, DEX_MAX_ATTEMPTS, wait,
+                problem, attempt, max_attempts, wait,
             )
             await asyncio.sleep(wait)
 
-    message = f"{problem} after {DEX_MAX_ATTEMPTS} attempts"
+    message = f"{problem} after {attempt} attempt(s)"
     if was_rate_limited:
         raise DexRateLimited(message)
     raise DexScreenerError(message)
@@ -505,7 +517,12 @@ async def fetch_paid_status(mint: str) -> Optional[bool]:
 
         result: Optional[bool] = None
         try:
-            orders = await dex_get_json(DEX_ORDERS_URL.format(mint))
+            # DEX Paid is optional: do not make the whole scan wait long for it
+            orders = await dex_get_json(DEX_ORDERS_URL.format(mint), max_attempts=2, max_retry_after=8.0)
+            if isinstance(orders, dict) and isinstance(orders.get("orders"), list):
+                orders = orders["orders"]
+            if not isinstance(orders, list):
+                log.warning("Unexpected DexScreener orders response type %s for %s", type(orders).__name__, mint)
             if isinstance(orders, list):
                 result = any(
                     isinstance(order, dict) and order.get("status") == "approved"
@@ -606,7 +623,8 @@ async def fetch_holders(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
     if reported_total is not None:
         complete = complete and len(all_accounts) >= reported_total
     top10 = (sum(amount for _, amount in ranked[:10]) / supply_raw * 100) if complete else None
-    top_five = [f"{amount / supply_raw * 100:.1f}%" for _, amount in ranked[:5]]
+    # Only report top wallets from a complete scan: a partial scan is not guaranteed to contain the real top holders
+    top_five = [f"{amount / supply_raw * 100:.1f}%" for _, amount in ranked[:5]] if complete else []
     return {
         "holder_count": len(owner_amounts) if complete else None,
         "top10_percent": top10,
@@ -845,7 +863,14 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
     if tracked_long_enough and data.get("ath_price") is not None and data.get("ath_distance") is not None:
         ath_text = f"{money(data['ath_price'])} ({data['ath_distance']:+.1f}% from tracked high)"
     top10 = holders.get("top10_percent")
-    top10_text = f"{top10:.1f}%" if top10 is not None else "N/A"
+    holders_incomplete = bool(holders) and not holders.get("complete")
+    scanned = holders.get("accounts_scanned")
+    top10_text = f"{top10:.1f}%" if top10 is not None else (
+        "N/A (scan incomplete)" if holders_incomplete else "N/A"
+    )
+    holder_count_text = fmt_count(holders.get("holder_count"))
+    if holders_incomplete and holders.get("holder_count") is None and scanned:
+        holder_count_text = f"N/A ({fmt_count(scanned)} accounts scanned, limit reached)" if scanned >= MAX_HOLDER_PAGES * HOLDER_PAGE_SIZE else f"N/A ({fmt_count(scanned)} accounts scanned)"
     mint_auth = "ACTIVE" if authorities.get("mint_authority_active") is True else (
         "REVOKED" if authorities and authorities.get("mint_authority_active") is False else "N/A"
     )
@@ -875,7 +900,7 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
         "", f"<b>🧠 NARRATIVE</b>\n{esc(narrative)}",
         "", "<b>🔒 SECURITY</b>",
         f"├ Mint: {mint_auth} | Freeze: {freeze_auth} | DEX Paid: {yes_no(data.get('dex_paid'))}",
-        f"├ Top 10: {top10_text} | Holders: {fmt_count(holders.get('holder_count'))}",
+        f"├ Top 10: {top10_text} | Holders: {holder_count_text}",
         f"├ Top wallets: {esc('|'.join(holders.get('top_five') or []) or 'N/A')}",
         "└ Bundle/Dev/Snipers/Fake holders: N/A (not attributed)",
         "", f"<b>⚠️ MARKET RISK:</b> {esc(market_text)}",
@@ -1045,7 +1070,7 @@ def main() -> None:
         raise SystemExit("Missing WEBHOOK_SECRET")
 
     app = (
-        Application.builder().token(BOT_TOKEN)
+        Application.builder().token(BOT_TOKEN).concurrent_updates(True)
         .post_init(post_init).post_shutdown(post_shutdown).build()
     )
     app.add_handler(CommandHandler("start", start))
