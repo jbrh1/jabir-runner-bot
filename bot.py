@@ -3,7 +3,6 @@ import os
 import re
 import asyncio
 import requests
-import html
 
 from telegram import (
     Update,
@@ -41,22 +40,32 @@ BOT_TAGLINE = "See Beyond The Chart."
 
 
 # =====================================
-# NARRATIVE ENGINE
+# GROQ NARRATIVE ENGINE
 # =====================================
 
 SYSTEM_PROMPT = """
 You are the Narrative Engine of Jabir Runner.
 
 Your job is to analyze DEX-traded tokens and score
-narrative strength using only supplied DexScreener data.
+narrative strength using only the supplied DexScreener data.
 
-EVIDENCE RULES:
-- Never claim to have searched X, Telegram, websites or news.
-- Never invent posts, metrics, partnerships or news.
+IMPORTANT EVIDENCE RULES:
+
+- Use only the supplied DexScreener data.
+- Do not claim to have searched X, Telegram, websites or news.
+- Never invent posts, metrics, partnerships, celebrities or news.
 - Mark unsupported information as Unverified.
 - Lower confidence when evidence is weak.
 - Do not confuse trading volume with genuine community interest.
+- DexScreener data alone cannot prove community authenticity
+  or viral social-media activity.
+- If evidence is unavailable, use a conservative score.
 
+STEP 1:
+Identify the token narrative in one sentence.
+If there is no clear narrative, say so and score low.
+
+STEP 2:
 Score these eight pillars from 0 to 10:
 
 1. Meme Simplicity (15%)
@@ -68,14 +77,12 @@ Score these eight pillars from 0 to 10:
 7. Community Authenticity (10%)
 8. Narrative-Token Connection (5%)
 
-Calculate the weighted score out of 10.
+STEP 3:
+Calculate the weighted total out of 10 using the weights above.
 
 GREEN: 7.5 - 10
 YELLOW: 5.0 - 7.4
 RED: below 5.0
-
-If evidence is unavailable, use a conservative score.
-Do not give high scores without credible evidence.
 
 OUTPUT FORMAT:
 
@@ -111,12 +118,14 @@ Unverified Items:
 Confidence: High/Medium/Low
 
 FINAL RULES:
+
 - Answer in Hausa.
 - Narrative analysis only, not financial advice.
 - Never tell the user to buy or sell.
 - Remind the user to check liquidity, holders, dev wallet,
   contract safety and risk management.
 - Never describe a token as safe based only on narrative.
+- Do not give high scores without credible evidence.
 """
 
 
@@ -125,6 +134,7 @@ FINAL RULES:
 # =====================================
 
 def main_keyboard():
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -137,13 +147,27 @@ def main_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
+def back_keyboard():
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🏠 Back to Home",
+                callback_data="back_home"
+            )
+        ]
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
 # =====================================
-# TELEGRAM COMMANDS
+# MESSAGE TEMPLATES
 # =====================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def welcome_message():
 
-    message = (
+    return (
         "🚀 <b>JABIR RUNNER</b>\n"
         "<i>See Beyond The Chart.</i>\n\n"
 
@@ -166,19 +190,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "cewa token yana da aminci.</i>"
     )
 
-    await update.message.reply_text(
-        message,
-        parse_mode="HTML",
-        reply_markup=main_keyboard()
-    )
 
+def help_message():
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    message = (
+    return (
         "📖 <b>JABIR RUNNER GUIDE</b>\n\n"
 
         "Yadda nake aiki:\n\n"
+
         "1. Ka samo Contract Address (CA).\n"
         "2. Ka turo min CA ɗin.\n"
         "3. Zan ɗauko bayanai daga DexScreener.\n"
@@ -189,14 +208,50 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Meme, Viral, News, Originality, Momentum, "
         "Longevity, Community da Connection.\n\n"
 
-        "⚠️ Wannan narrative analysis ne kawai, "
+        "⚠️ Wannan Narrative Analysis ne kawai, "
         "ba shawarar siye ko sayarwa ba."
     )
 
+
+def how_to_use_message():
+
+    return (
+        "📖 <b>HOW TO USE JABIR RUNNER</b>\n\n"
+
+        "1. Buɗe DexScreener ka samo CA.\n"
+        "2. Turo CA ɗin nan.\n"
+        "3. Zan ɗauko bayanan token.\n"
+        "4. Groq AI zai tantance narrative.\n"
+        "5. Za ka samu score da bayanin haɗari.\n\n"
+
+        "⚠️ Ka tabbatar CA ɗin da ka turo daidai ne."
+    )
+
+
+# =====================================
+# TELEGRAM COMMANDS
+# =====================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     await update.message.reply_text(
-        message,
+        welcome_message(),
         parse_mode="HTML",
         reply_markup=main_keyboard()
+    )
+
+
+async def help_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+        help_message(),
+        parse_mode="HTML"
     )
 
 
@@ -214,21 +269,18 @@ async def button_handler(
 
     if query.data == "how_to_use":
 
-        message = (
-            "📖 <b>HOW TO USE JABIR RUNNER</b>\n\n"
-
-            "1. Buɗe DexScreener ka samo CA.\n"
-            "2. Turo CA ɗin nan.\n"
-            "3. Zan ɗauko bayanan token.\n"
-            "4. Groq AI zai tantance narrative.\n"
-            "5. Za ka samu score da bayanin haɗari.\n\n"
-
-            "⚠️ Ka tabbatar da CA kafin amfani."
+        await query.edit_message_text(
+            how_to_use_message(),
+            parse_mode="HTML",
+            reply_markup=back_keyboard()
         )
 
-        await query.message.reply_text(
-            message,
-            parse_mode="HTML"
+    elif query.data == "back_home":
+
+        await query.edit_message_text(
+            welcome_message(),
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
         )
 
 
@@ -238,9 +290,16 @@ async def button_handler(
 
 def get_dex_data(ca):
 
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
+    url = (
+        "https://api.dexscreener.com/latest/dex/tokens/"
+        f"{ca}"
+    )
 
-    response = requests.get(url, timeout=20)
+    response = requests.get(
+        url,
+        timeout=20
+    )
+
     response.raise_for_status()
 
     data = response.json()
@@ -249,13 +308,20 @@ def get_dex_data(ca):
     if not pairs:
         return None
 
-    pair = sorted(
+    def get_liquidity(pair):
+
+        try:
+            return float(
+                (pair.get("liquidity") or {}).get("usd") or 0
+            )
+        except (ValueError, TypeError):
+            return 0
+
+    # Select pair with highest USD liquidity
+    pair = max(
         pairs,
-        key=lambda x: float(
-            (x.get("liquidity") or {}).get("usd") or 0
-        ),
-        reverse=True
-    )[0]
+        key=get_liquidity
+    )
 
     return pair
 
@@ -267,7 +333,9 @@ def get_dex_data(ca):
 def analyze_with_groq(ca, dex_info):
 
     if not GROQ_KEY:
-        raise ValueError("GROQ_API_KEY is missing in Render.")
+        raise ValueError(
+            "GROQ_API_KEY is missing in Render."
+        )
 
     url = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -277,7 +345,8 @@ def analyze_with_groq(ca, dex_info):
     }
 
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
+
         "messages": [
             {
                 "role": "system",
@@ -288,11 +357,11 @@ def analyze_with_groq(ca, dex_info):
                 "content": (
                     f"Contract Address: {ca}\n\n"
                     f"DexScreener Data:\n{dex_info}\n\n"
-                    "Yi cikakken Narrative analysis yanzu."
+                    "Yi cikakken Narrative Analysis yanzu."
                 ),
             },
         ],
-        "temperature": 0.3,
+
         "max_tokens": 1800,
     }
 
@@ -300,25 +369,33 @@ def analyze_with_groq(ca, dex_info):
         url,
         headers=headers,
         json=payload,
-        timeout=60,
+        timeout=90,
     )
 
     if not response.ok:
+
         raise RuntimeError(
             f"Groq HTTP {response.status_code}: "
             f"{response.text[:500]}"
         )
 
     data = response.json()
+
     choices = data.get("choices") or []
 
     if not choices:
-        raise RuntimeError("Groq returned no choices.")
+        raise RuntimeError(
+            "Groq returned no choices."
+        )
 
-    content = choices[0].get("message", {}).get("content")
+    content = choices[0].get(
+        "message", {}
+    ).get("content")
 
     if not content:
-        raise RuntimeError("Groq returned an empty response.")
+        raise RuntimeError(
+            "Groq returned an empty response."
+        )
 
     return content
 
@@ -345,20 +422,24 @@ async def handle_ca(
     if not ca_match:
 
         await update.message.reply_text(
-            "Ban gane CA ba. Ka turo Contract Address kawai."
+            "❌ Ban gane CA ba.\n\n"
+            "Ka turo Contract Address kawai."
         )
+
         return
 
     ca = ca_match.group(1)
 
     status = await update.message.reply_text(
-        "🔍 <b>JABIR RUNNER SCANNER</b>\n\n"
-        "An karɓi Contract Address.\n"
-        "⏳ Ina ɗauko bayanan DexScreener...",
-        parse_mode="HTML"
+        "🔍 JABIR RUNNER SCANNER\n\n"
+        "✅ An karɓi Contract Address.\n"
+        "⏳ Ina ɗauko bayanan DexScreener..."
     )
 
-    # Fetch DexScreener data
+    # =================================
+    # FETCH DEXSCREENER DATA
+    # =================================
+
     try:
 
         pair = await asyncio.to_thread(
@@ -371,31 +452,42 @@ async def handle_ca(
         print(f"DexScreener Error: {e}")
 
         await status.edit_text(
-            "❌ <b>SCAN FAILED</b>\n\n"
+            "❌ SCAN FAILED\n\n"
             "An samu matsala wajen haɗuwa da DexScreener.\n"
-            "Ka sake gwadawa daga baya.",
-            parse_mode="HTML"
+            "Ka sake gwadawa daga baya."
         )
+
         return
 
     if not pair:
 
         await status.edit_text(
-            "❌ <b>TOKEN NOT FOUND</b>\n\n"
+            "❌ TOKEN NOT FOUND\n\n"
             "Ban samu token ɗin a DexScreener ba.\n"
-            "Ka tabbatar CA ɗin daidai ne.",
-            parse_mode="HTML"
+            "Ka tabbatar CA ɗin daidai ne."
         )
+
         return
 
-    # Extract token information
-    name = pair.get("baseToken", {}).get("name", "Unknown")
-    ticker = pair.get("baseToken", {}).get("symbol", "?")
+    # =================================
+    # EXTRACT TOKEN INFORMATION
+    # =================================
+
+    base_token = pair.get("baseToken") or {}
+
+    name = base_token.get("name", "Unknown")
+    ticker = base_token.get("symbol", "?")
     chain = pair.get("chainId", "?")
     price = pair.get("priceUsd", "?")
 
-    liquidity = (pair.get("liquidity") or {}).get("usd", 0)
-    volume = (pair.get("volume") or {}).get("h24", 0)
+    liquidity = (
+        pair.get("liquidity") or {}
+    ).get("usd", 0)
+
+    volume = (
+        pair.get("volume") or {}
+    ).get("h24", 0)
+
     fdv = pair.get("fdv", 0)
 
     dex_info = (
@@ -410,15 +502,16 @@ async def handle_ca(
         f"URL: {pair.get('url')}"
     )
 
-    # Update loading status
+    # =================================
+    # GROQ ANALYSIS
+    # =================================
+
     await status.edit_text(
-        "🧠 <b>NARRATIVE ENGINE</b>\n\n"
-        "DexScreener data received.\n"
-        "⏳ Groq AI na nazarin narrative...",
-        parse_mode="HTML"
+        "🧠 JABIR RUNNER NARRATIVE ENGINE\n\n"
+        "✅ DexScreener data received.\n"
+        "⏳ Groq AI na nazarin narrative..."
     )
 
-    # Run Groq analysis
     try:
 
         result = await asyncio.to_thread(
@@ -427,10 +520,21 @@ async def handle_ca(
             dex_info
         )
 
+        report = (
+            "🚀 JABIR RUNNER REPORT\n\n"
+            f"{result}"
+        )
+
+        # Telegram text limit is 4096 characters
+        if len(report) > 3900:
+
+            report = (
+                report[:3850]
+                + "\n\n[Report shortened to fit Telegram.]"
+            )
+
         await status.edit_text(
-            f"🚀 <b>JABIR RUNNER REPORT</b>\n\n"
-            f"{html.escape(result)}",
-            parse_mode="HTML",
+            report,
             disable_web_page_preview=True
         )
 
@@ -438,27 +542,25 @@ async def handle_ca(
 
         print(f"Groq Analysis Error: {e}")
 
-        safe_name = html.escape(str(name))
-        safe_ticker = html.escape(str(ticker))
-        safe_chain = html.escape(str(chain))
-        safe_url = html.escape(str(pair.get("url", "")), quote=True)
-
         fallback = (
-            f"🚀 <b>JABIR RUNNER REPORT</b>\n\n"
-            f"<b>{safe_name} (${safe_ticker})</b>\n"
-            f"Chain: {safe_chain}\n\n"
-            f"Price: ${html.escape(str(price))}\n"
-            f"Liquidity: ${html.escape(str(liquidity))}\n"
-            f"Volume 24h: ${html.escape(str(volume))}\n"
-            f"FDV: ${html.escape(str(fdv))}\n\n"
+            "🚀 JABIR RUNNER REPORT\n\n"
+
+            f"{name} (${ticker})\n"
+            f"Chain: {chain}\n\n"
+
+            f"Price: ${price}\n"
+            f"Liquidity: ${liquidity}\n"
+            f"Volume 24h: ${volume}\n"
+            f"FDV: ${fdv}\n\n"
+
             "⚠️ AI Narrative Analysis bai samu nasara ba.\n"
-            "Ka duba Render Logs domin ganin kuskuren.\n\n"
-            f'<a href="{safe_url}">Open DexScreener</a>'
+            "Ka duba Render Logs domin ganin ainihin kuskuren.\n\n"
+
+            f"DexScreener: {pair.get('url', 'Unavailable')}"
         )
 
         await status.edit_text(
             fallback,
-            parse_mode="HTML",
             disable_web_page_preview=True
         )
 
@@ -470,18 +572,29 @@ async def handle_ca(
 if __name__ == "__main__":
 
     if not TOKEN:
-        raise ValueError("TELEGRAM_TOKEN is missing!")
+        raise ValueError(
+            "TELEGRAM_TOKEN is missing!"
+        )
 
     if not RENDER_URL:
-        raise ValueError("RENDER_EXTERNAL_URL is missing!")
+        raise ValueError(
+            "RENDER_EXTERNAL_URL is missing!"
+        )
 
     if not WEBHOOK_SECRET:
-        raise ValueError("WEBHOOK_SECRET is missing!")
+        raise ValueError(
+            "WEBHOOK_SECRET is missing!"
+        )
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("help", help_cmd)
+    )
 
     app.add_handler(
         CallbackQueryHandler(button_handler)
@@ -504,5 +617,5 @@ if __name__ == "__main__":
         secret_token=WEBHOOK_SECRET,
         drop_pending_updates=False,
         bootstrap_retries=-1,
-    )
-        
+)
+    
