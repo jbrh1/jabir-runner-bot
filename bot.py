@@ -37,7 +37,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
 HELIUS_KEY = os.getenv("HELIUS_API_KEY")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")  # llama-3.3-70b-versatile was shut down by Groq
 
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
@@ -251,18 +251,30 @@ def tracking_data(mint: str) -> dict[str, Any]:
     }
 
 # ------------------------------ HTTP / API -----------------------------------
+def _scrub(text: str) -> str:
+    """Remove API keys/tokens from any text before it is logged."""
+    for secret in (HELIUS_KEY, GROQ_KEY, BOT_TOKEN):
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
 async def request_json(method: str, url: str, **kwargs: Any) -> Any:
     """Generic JSON request used for Helius and Groq (NOT for DexScreener)."""
     if _http is None:
         raise RuntimeError("HTTP client is not initialized")
-    last_error = None
+    last_error = "unknown error"
     for attempt in range(2):
         try:
             response = await _http.request(method, url, **kwargs)
             response.raise_for_status()
             return response.json()
+        except httpx.HTTPStatusError as exc:
+            body = _scrub(exc.response.text[:300].replace("\n", " "))
+            last_error = f"HTTP {exc.response.status_code}: {body}"
+            if attempt == 0:
+                await asyncio.sleep(0.5)
         except (httpx.HTTPError, ValueError) as exc:
-            last_error = exc
+            last_error = _scrub(f"{type(exc).__name__}: {exc}")
             if attempt == 0:
                 await asyncio.sleep(0.5)
     raise RuntimeError(f"API request failed: {last_error}")
@@ -728,6 +740,10 @@ def security_assessment(data: dict[str, Any]) -> dict[str, Any]:
     top10 = holders.get("top10_percent")
     if top10 is not None and top10 >= 50:
         flags.append(f"Top 10 wallets hold {top10:.1f}%")
+        top_five = holders.get("top_five") or []
+        top_one = safe_num(str(top_five[0]).rstrip("%")) if top_five else None
+        if top_one is not None and top_one >= 50:
+            flags.append(f"Top wallet holds {top_one:.1f}% (may be bonding curve/pool, not verified)")
     if flags:
         level = "HIGH"
     elif not authorities:
@@ -746,6 +762,9 @@ def verdict(data: dict[str, Any]) -> tuple[str, str]:
     security = security_assessment(data)
     if liq is not None and mc is not None and liq < 10_000 and mc > 100_000:
         return "🔴 AVOID", "Low liquidity relative to valuation"
+    if (age is not None and age >= 3600 and mc is not None and mc < 5_000
+            and (vol is None or vol < 1_000)):
+        return "🔴 AVOID", f"Dead/illiquid: MC {money(mc)}, 24h vol {money(vol)}"
     if any(level == "HIGH" for level, _ in flags) or security["level"] == "HIGH":
         return "🟡 WATCH", "High-risk warning detected; inspect the flags"
     if age is not None and age < 3600 and vol is not None and mc and vol > mc * 2:
@@ -781,19 +800,24 @@ async def groq_narrative(data: dict[str, Any]) -> str:
         "Data: " + json.dumps(prompt_data, ensure_ascii=False)
     )
     try:
+        payload: dict[str, Any] = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": "Return only two concise Hausa lines. No unsupported claims."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            # gpt-oss models "think" first and thinking tokens count toward this limit
+            "max_tokens": 800,
+        }
+        if "gpt-oss" in GROQ_MODEL.lower():
+            payload["reasoning_effort"] = "low"
         result = await request_json(
             "POST", GROQ_URL,
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": "Return only two concise Hausa lines. No unsupported claims."},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.2, "max_tokens": 130,
-            },
+            json=payload,
         )
-        content = result["choices"][0]["message"]["content"].strip()
+        content = (result["choices"][0]["message"].get("content") or "").strip()
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         return "\n".join(lines[:2]) if lines else "AI narrative: N/A"
     except Exception as exc:
@@ -815,8 +839,10 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
     mc_text = money(mc_value) if mc_value is not None else (
         f"N/A (FDV {money(data.get('fdv'))})" if data.get("fdv") is not None else "N/A"
     )
-    ath_text = "N/A (tracked since bot's first scan)"
-    if data.get("ath_price") is not None and data.get("ath_distance") is not None:
+    ath_text = "N/A (tracking just started)"
+    first_seen = data.get("first_seen")
+    tracked_long_enough = first_seen is not None and time.time() - first_seen >= 600
+    if tracked_long_enough and data.get("ath_price") is not None and data.get("ath_distance") is not None:
         ath_text = f"{money(data['ath_price'])} ({data['ath_distance']:+.1f}% from tracked high)"
     top10 = holders.get("top10_percent")
     top10_text = f"{top10:.1f}%" if top10 is not None else "N/A"
