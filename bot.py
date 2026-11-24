@@ -783,8 +783,11 @@ def verdict(data: dict[str, Any]) -> tuple[str, str]:
     if (age is not None and age >= 3600 and mc is not None and mc < 5_000
             and (vol is None or vol < 1_000)):
         return "🔴 AVOID", f"Dead/illiquid: MC {money(mc)}, 24h vol {money(vol)}"
-    if any(level == "HIGH" for level, _ in flags) or security["level"] == "HIGH":
-        return "🟡 WATCH", "High-risk warning detected; inspect the flags"
+    high_texts = [text for level, text in flags if level == "HIGH"]
+    if security["level"] == "HIGH":
+        high_texts += security["flags"]
+    if high_texts:
+        return "🟡 WATCH", "High risk: " + high_texts[0]
     if age is not None and age < 3600 and vol is not None and mc and vol > mc * 2:
         return "🟡 WATCH", "Very new pair with unusually high volume"
     if chg is not None and chg > 100 and liq is not None and vol is not None and vol > liq:
