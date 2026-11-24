@@ -1,7 +1,9 @@
 """
-JABIR RUNNER V3
+JABIR RUNNER V3 - FINAL FIXED (DexScreener 429 hardening)
 Solana token scanner | Python 3.11 | python-telegram-bot 21+
 DexScreener + Helius + Groq | Render Webhook
+
+Optional env vars: CACHE_TTL (default 60), PAID_CACHE_TTL (default 300)
 """
 from __future__ import annotations
 
@@ -12,11 +14,15 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import sqlite3
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
 import httpx
@@ -31,7 +37,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
 HELIUS_KEY = os.getenv("HELIUS_API_KEY")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
@@ -44,10 +50,19 @@ HELIUS_RPC_URL = "https://mainnet.helius-rpc.com/"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 DB_PATH = os.getenv("DB_PATH", "jabir_runner.db")
-CACHE_TTL = int(os.getenv("CACHE_TTL", "25"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "60"))               # token data cache (seconds)
+PAID_CACHE_TTL = int(os.getenv("PAID_CACHE_TTL", "300"))    # DexScreener orders / DEX Paid cache
+PAID_FAIL_TTL = 30                                          # short cache for failed orders lookups
+NOT_FOUND_TTL = 20                                          # short cache for "no pair found"
 CACHE_MAX = 500
 MAX_HOLDER_PAGES = 10
 HOLDER_PAGE_SIZE = 1000
+
+# DexScreener rate limiting
+DEX_MIN_INTERVAL = 1.2      # minimum seconds between ANY two DexScreener requests
+DEX_MAX_ATTEMPTS = 5        # attempts per call (429, 5xx and network errors are retried)
+DEX_BACKOFF_BASE = 2.0      # exponential backoff base, seconds
+DEX_MAX_WAIT = 20.0         # never wait longer than this between attempts
 
 TEST_TOKENS = {
     "testicles": "3pGmCpDCr2B6cZFhFJFtLrcMCadMvjV4dB9UGJyNpump",
@@ -64,6 +79,32 @@ logging.basicConfig(
 log = logging.getLogger("jabir_runner")
 _http: Optional[httpx.AsyncClient] = None
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_missing_cache: dict[str, tuple[float, None]] = {}
+_paid_cache: dict[str, tuple[float, Optional[bool]]] = {}
+
+# DexScreener shared limiter state (one request at a time, spaced by DEX_MIN_INTERVAL)
+_dex_semaphore: Optional[asyncio.Semaphore] = None
+_dex_last_request: float = -1e9
+_MISS = object()
+
+
+class DexScreenerError(RuntimeError):
+    """DexScreener request failed (permanent 4xx, repeated 5xx/network errors, bad data)."""
+
+
+class DexRateLimited(DexScreenerError):
+    """DexScreener kept answering HTTP 429 after all retries."""
+
+
+class _LockEntry:
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
+
+
+_mint_locks: dict[str, _LockEntry] = {}
 
 # ------------------------------ HELPERS --------------------------------------
 def safe_num(value: Any) -> Optional[float]:
@@ -211,6 +252,7 @@ def tracking_data(mint: str) -> dict[str, Any]:
 
 # ------------------------------ HTTP / API -----------------------------------
 async def request_json(method: str, url: str, **kwargs: Any) -> Any:
+    """Generic JSON request used for Helius and Groq (NOT for DexScreener)."""
     if _http is None:
         raise RuntimeError("HTTP client is not initialized")
     last_error = None
@@ -225,6 +267,127 @@ async def request_json(method: str, url: str, **kwargs: Any) -> Any:
                 await asyncio.sleep(0.5)
     raise RuntimeError(f"API request failed: {last_error}")
 
+# ---- DexScreener: shared rate limiter + retry ----
+def _get_dex_semaphore() -> asyncio.Semaphore:
+    """Created lazily so it always belongs to the running event loop."""
+    global _dex_semaphore
+    if _dex_semaphore is None:
+        _dex_semaphore = asyncio.Semaphore(1)
+    return _dex_semaphore
+
+def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
+    """Parse Retry-After (seconds or HTTP date). Returns None if absent/invalid."""
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        seconds = float(raw)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+def _dex_backoff(attempt: int) -> float:
+    """Exponential backoff with jitter, capped at DEX_MAX_WAIT."""
+    return min(DEX_MAX_WAIT, DEX_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0.0, 1.0))
+
+async def dex_get_json(url: str) -> Any:
+    """
+    The ONLY way the bot talks to DexScreener (token AND orders endpoints).
+    - One request at a time (semaphore wraps the whole request + retry loop)
+    - At least DEX_MIN_INTERVAL seconds between requests
+    - Up to DEX_MAX_ATTEMPTS attempts for 429, 5xx, network errors, bad JSON
+    - 429: honors Retry-After, otherwise exponential backoff + jitter
+    - Other 4xx (404, 400...) are permanent: raised immediately, no retry
+    """
+    global _dex_last_request
+    if _http is None:
+        raise RuntimeError("HTTP client is not initialized")
+
+    async with _get_dex_semaphore():
+        problem = "unknown error"
+        was_rate_limited = False
+        for attempt in range(1, DEX_MAX_ATTEMPTS + 1):
+            gap = DEX_MIN_INTERVAL - (time.monotonic() - _dex_last_request)
+            if gap > 0:
+                await asyncio.sleep(gap)
+
+            wait = _dex_backoff(attempt)
+            was_rate_limited = False
+            try:
+                response = await _http.get(url)
+            except httpx.TransportError as exc:  # timeouts, connect/read errors
+                _dex_last_request = time.monotonic()
+                problem = f"network error ({type(exc).__name__})"
+            else:
+                _dex_last_request = time.monotonic()
+                status = response.status_code
+                if status == 429:
+                    was_rate_limited = True
+                    problem = "HTTP 429 Too Many Requests"
+                    retry_after = _retry_after_seconds(response)
+                    if retry_after is not None:
+                        if retry_after > DEX_MAX_WAIT:
+                            raise DexRateLimited(
+                                f"HTTP 429, Retry-After {retry_after:.0f}s is above the "
+                                f"{DEX_MAX_WAIT:.0f}s limit"
+                            )
+                        wait = retry_after + random.uniform(0.0, 0.5)
+                elif status >= 500:
+                    problem = f"HTTP {status} server error"
+                elif status >= 400:
+                    raise DexScreenerError(f"HTTP {status} (not retried)")
+                else:
+                    try:
+                        return response.json()
+                    except ValueError:
+                        problem = "invalid JSON in response"
+
+            if attempt >= DEX_MAX_ATTEMPTS:
+                break
+            log.warning(
+                "DexScreener %s (attempt %d/%d) - retrying in %.1fs",
+                problem, attempt, DEX_MAX_ATTEMPTS, wait,
+            )
+            await asyncio.sleep(wait)
+
+    message = f"{problem} after {DEX_MAX_ATTEMPTS} attempts"
+    if was_rate_limited:
+        raise DexRateLimited(message)
+    raise DexScreenerError(message)
+
+@asynccontextmanager
+async def mint_lock(key: str) -> AsyncIterator[None]:
+    """Per-key async lock; entries are removed when nobody is using them."""
+    entry = _mint_locks.get(key)
+    if entry is None:
+        entry = _LockEntry()
+        _mint_locks[key] = entry
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0 and _mint_locks.get(key) is entry:
+            del _mint_locks[key]
+
+def _trim_cache(cache: dict[str, tuple[Any, ...]], ttl: float) -> None:
+    if len(cache) < CACHE_MAX:
+        return
+    now = time.time()
+    for key in [k for k, v in cache.items() if now - v[0] >= ttl]:
+        cache.pop(key, None)
+    if len(cache) >= CACHE_MAX:
+        cache.pop(next(iter(cache)))
+
 async def helius_rpc(method: str, params: Any) -> Any:
     if not HELIUS_KEY:
         return None
@@ -237,25 +400,17 @@ async def helius_rpc(method: str, params: Any) -> Any:
         raise RuntimeError(str(result["error"]))
     return result.get("result")
 
-async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
-    now = time.time()
-    cached = _cache.get(mint)
-    if cached and now - cached[0] < CACHE_TTL:
-        return cached[1]
+def _cached_pair(mint: str) -> Optional[dict[str, Any]]:
+    entry = _cache.get(mint)
+    if entry and time.time() - entry[0] < CACHE_TTL:
+        return entry[1]
+    return None
 
-    payload = await request_json("GET", DEX_TOKEN_URL.format(mint))
-    pairs = payload.get("pairs") or []
-    matching = [
-        p for p in pairs
-        if isinstance(p, dict)
-        and p.get("chainId") == "solana"
-        and str(nested(p, "baseToken", "address") or "").lower() == mint.lower()
-    ]
-    if not matching:
-        return None
+def _recently_missing(mint: str) -> bool:
+    entry = _missing_cache.get(mint)
+    return bool(entry and time.time() - entry[0] < NOT_FOUND_TTL)
 
-    # Aggregate distinct pools for liquidity/volume/transactions, but use the
-    # most active pool for price, pair URL and chart link.
+def _combine_pairs(matching: list[dict[str, Any]]) -> dict[str, Any]:
     primary = max(
         matching,
         key=lambda p: (safe_num(nested(p, "volume", "h24")) or 0,
@@ -276,34 +431,81 @@ async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
             "sells": sum(v for v in sells if v is not None) if any(v is not None for v in sells) else None,
         }
     combined["txns"] = txns
-    # Keep the most active pool's price/changes and token-level FDV/MC.
     if combined.get("marketCap") is None:
         combined["marketCap"] = next((p.get("marketCap") for p in matching if p.get("marketCap") is not None), None)
     if combined.get("fdv") is None:
         combined["fdv"] = next((p.get("fdv") for p in matching if p.get("fdv") is not None), None)
     combined["_pool_count"] = len(matching)
-
-    if len(_cache) >= CACHE_MAX:
-        expired = [key for key, (stamp, _) in _cache.items() if now - stamp >= CACHE_TTL]
-        for key in expired:
-            _cache.pop(key, None)
-        if len(_cache) >= CACHE_MAX:
-            _cache.pop(next(iter(_cache)))
-    _cache[mint] = (now, combined)
     return combined
 
-async def fetch_paid_status(mint: str) -> Optional[bool]:
-    try:
-        orders = await request_json("GET", DEX_ORDERS_URL.format(mint))
-        if not isinstance(orders, list):
-            return None
-        return any(
-            isinstance(order, dict) and order.get("status") == "approved"
-            for order in orders
-        )
-    except Exception as exc:
-        log.warning("Dex paid status unavailable for %s: %s", mint, exc)
+async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
+    cached = _cached_pair(mint)
+    if cached is not None:
+        return cached
+    if _recently_missing(mint):
         return None
+
+    async with mint_lock(f"pair:{mint}"):
+        # Recheck after getting the lock: another scan may have just filled the cache.
+        cached = _cached_pair(mint)
+        if cached is not None:
+            return cached
+        if _recently_missing(mint):
+            return None
+
+        payload = await dex_get_json(DEX_TOKEN_URL.format(mint))
+        pairs = payload.get("pairs") if isinstance(payload, dict) else None
+        if not isinstance(pairs, list):
+            pairs = []
+        matching = [
+            p for p in pairs
+            if isinstance(p, dict)
+            and p.get("chainId") == "solana"
+            and str(nested(p, "baseToken", "address") or "").lower() == mint.lower()
+        ]
+        if not matching:
+            _trim_cache(_missing_cache, NOT_FOUND_TTL)
+            _missing_cache[mint] = (time.time(), None)
+            return None
+
+        combined = _combine_pairs(matching)
+        _trim_cache(_cache, CACHE_TTL)
+        _cache[mint] = (time.time(), combined)
+        _missing_cache.pop(mint, None)
+        return combined
+
+def _cached_paid(mint: str) -> Any:
+    entry = _paid_cache.get(mint)
+    if not entry:
+        return _MISS
+    ttl = PAID_CACHE_TTL if entry[1] is not None else PAID_FAIL_TTL
+    return entry[1] if time.time() - entry[0] < ttl else _MISS
+
+async def fetch_paid_status(mint: str) -> Optional[bool]:
+    cached = _cached_paid(mint)
+    if cached is not _MISS:
+        return cached
+
+    async with mint_lock(f"paid:{mint}"):
+        cached = _cached_paid(mint)
+        if cached is not _MISS:
+            return cached
+
+        result: Optional[bool] = None
+        try:
+            orders = await dex_get_json(DEX_ORDERS_URL.format(mint))
+            if isinstance(orders, list):
+                result = any(
+                    isinstance(order, dict) and order.get("status") == "approved"
+                    for order in orders
+                )
+        except Exception as exc:
+            log.warning("Dex paid status unavailable for %s: %s", mint, exc)
+            result = None
+
+        _trim_cache(_paid_cache, PAID_CACHE_TTL)
+        _paid_cache[mint] = (time.time(), result)  # failures (None) are cached only briefly
+        return result
 
 async def fetch_supply(mint: str) -> Optional[dict[str, Any]]:
     result = await helius_rpc("getTokenSupply", [mint, {"commitment": "confirmed"}])
@@ -332,7 +534,6 @@ async def fetch_authorities(mint: str) -> Optional[dict[str, Any]]:
         raw = base64.b64decode(account_data[0])
     except Exception:
         return None
-    # Standard SPL Mint layout. Token-2022 extensions need a separate decoder.
     if len(raw) < 82:
         return None
 
@@ -390,8 +591,6 @@ async def fetch_holders(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
             owner_amounts[owner] = owner_amounts.get(owner, 0) + amount
 
     ranked = sorted(owner_amounts.items(), key=lambda item: item[1], reverse=True)
-    # Only call the result complete when pagination ended normally and, if
-    # Helius supplied a total, the number of accounts matches it.
     if reported_total is not None:
         complete = complete and len(all_accounts) >= reported_total
     top10 = (sum(amount for _, amount in ranked[:10]) / supply_raw * 100) if complete else None
@@ -501,9 +700,10 @@ def market_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
     age = data.get("age_sec")
     if liq is not None and liq < 10_000:
         flags.append(("HIGH", "Liquidity below $10K"))
-    if liq is not None and mc and mc >= 100_000 and liq / mc < 0.02:
+    # FIXED: LP/MC check ONLY for small/mid caps 100K - 50M. Large caps like PENGU are exempt.
+    if liq is not None and mc and 100_000 <= mc <= 50_000_000 and liq / mc < 0.02:
         flags.append(("HIGH", f"LP/MC very thin ({liq / mc * 100:.1f}%)"))
-    elif liq is not None and mc and mc >= 100_000 and liq / mc < 0.05:
+    elif liq is not None and mc and 100_000 <= mc <= 50_000_000 and liq / mc < 0.05:
         flags.append(("MEDIUM", f"LP/MC thin ({liq / mc * 100:.1f}%)"))
     if age is not None and age < 3600:
         flags.append(("MEDIUM", "Pair younger than 1 hour"))
@@ -552,11 +752,15 @@ def verdict(data: dict[str, Any]) -> tuple[str, str]:
         return "🟡 WATCH", "Very new pair with unusually high volume"
     if chg is not None and chg > 100 and liq is not None and vol is not None and vol > liq:
         return "🟡 WATCH", "Potentially overheated; wait for confirmation"
+    # FIXED: Allow BUY when data is clean
+    ratio = buy_ratio(data)
+    if chg is not None and chg > 0 and ratio is not None and ratio >= 0.55 and liq is not None and liq >= 25_000 and age is not None and age >= 3600:
+        return "🟢 BUY", f"Up {chg:.1f}%, {ratio*100:.0f}% buys, LP {money(liq)}"
     missing = []
     if not HELIUS_KEY: missing.append("Helius key missing")
     if security["level"] in ("UNKNOWN", "PARTIAL"): missing.append("on-chain checks incomplete")
     if data.get("buys24") is None or data.get("sells24") is None: missing.append("transaction data incomplete")
-    return "🟡 WATCH", "No automatic BUY signal. " + (", ".join(missing) if missing else "Use a separately tested strategy.")
+    return "🟡 WATCH", "No momentum confirmation. " + (", ".join(missing) if missing else "Use a separately tested strategy.")
 
 async def groq_narrative(data: dict[str, Any]) -> str:
     if not GROQ_KEY:
@@ -692,8 +896,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• Refresh yana sabunta market data.\n"
             "• Deep Scan yana neman holder data ta Helius.\n\n"
             "ATH yana farawa daga lokacin tracking. Bundle/dev/sniper/fake-holder "
-            "attribution bai gama ginawa ba. Ba a fitar da automatic BUY signal. "
-            "Helius da Groq suna buƙatar API keys nasu.",
+            "attribution bai gama ginawa ba. Helius da Groq suna buƙatar API keys nasu.",
             parse_mode=ParseMode.HTML,
         )
 
@@ -701,6 +904,16 @@ async def perform_scan(
     mint: str, context: ContextTypes.DEFAULT_TYPE,
     status_message=None, chat_id: Optional[int] = None, deep: bool = False,
 ) -> None:
+    async def notify(text: str) -> None:
+        """Send a plain error notice without ever raising."""
+        try:
+            if status_message:
+                await status_message.edit_text(text)
+            elif chat_id is not None:
+                await context.bot.send_message(chat_id, text)
+        except Exception:
+            log.exception("Could not send scan notice")
+
     try:
         if status_message:
             await status_message.edit_text("🔍 JABIR RUNNER\n\n⏳ Fetching market data...")
@@ -726,16 +939,15 @@ async def perform_scan(
             await status_message.edit_text(message, parse_mode=ParseMode.HTML)
         elif chat_id is not None:
             await context.bot.send_message(chat_id, message, parse_mode=ParseMode.HTML)
+    except DexRateLimited as exc:
+        log.warning("Scan for %s stopped by DexScreener rate limit: %s", mint, exc)
+        await notify("⏳ DexScreener is rate-limiting requests right now. Please try again in about a minute.")
+    except DexScreenerError as exc:
+        log.warning("Scan for %s failed, DexScreener error: %s", mint, exc)
+        await notify("❌ DexScreener is not responding properly right now. Please try again shortly.")
     except Exception:
         log.exception("Scan failed for %s", mint)
-        message = "❌ Scan failed. Duba Render Logs da API keys/configuration."
-        try:
-            if status_message:
-                await status_message.edit_text(message)
-            elif chat_id is not None:
-                await context.bot.send_message(chat_id, message)
-        except Exception:
-            log.exception("Could not send scan failure message")
+        await notify("❌ Scan failed. Duba Render Logs da API keys/configuration.")
 
 async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
