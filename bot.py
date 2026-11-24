@@ -1,884 +1,520 @@
 """
-JABIR RUNNER V2
-Solana token scanner | Python 3.11 | python-telegram-bot 21+ | DexScreener + Helius + Groq
-Run mode: Render Webhook (requires RENDER_EXTERNAL_URL and WEBHOOK_SECRET)
+JABIR RUNNER | Solana token scanner bot (v1)
+Python 3.11 | python-telegram-bot v20+ | DexScreener (no key) | in-memory cache
+Env var required: BOT_TOKEN
 """
-from __future__ import annotations
-
 import asyncio
-import base64
 import html
-import json
 import logging
 import math
 import os
 import re
-import sqlite3
 import time
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters,
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-# ------------------------------ CONFIG ---------------------------------------
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
-HELIUS_KEY = os.getenv("HELIUS_API_KEY")
-GROQ_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-WEBHOOK_PATH = "telegram-webhook"
-
-DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
-DEX_ORDERS_URL = "https://api.dexscreener.com/orders/v1/solana/{}"
-HELIUS_RPC_URL = "https://mainnet.helius-rpc.com/"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-DB_PATH = os.getenv("DB_PATH", "jabir_runner.db")
-CACHE_TTL = int(os.getenv("CACHE_TTL", "25"))
-CACHE_MAX = 500
-MAX_HOLDER_PAGES = 10
-HOLDER_PAGE_SIZE = 1000
-
-BUNDLE_AVOID = 40.0
-DEV_LEFT_AVOID = 5.0
-FAKE_HOLDER_AVOID = 30.0
-
-TEST_TOKENS = {
-    "testicles": "3pGmCpDCr2B6cZFhFJFtLrcMCadMvjV4dB9UGJyNpump",
-    "pengu": "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv",
-    "grokius": "67ezHLk8PUkjJCXjmmgPbx85VowA52ghfRXa9A8Tpump",
-}
-
-SOL_ADDR_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])")
-BAR = "━━━━━━━━━━━━"
-log = logging.getLogger("jabir_runner")
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
+log = logging.getLogger("jabir_runner")
 
-_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-_http: Optional[httpx.AsyncClient] = None
+# ----------------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------------
+DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+CACHE_TTL = 30  # seconds
+CACHE_MAX = 500
+SOL_ADDR_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")  # base58, no 0 O I l
+ERR_MSG = "Token not found or API down"
+BAR = "━━━━━━━━━━━━"
+
+_cache: dict[str, tuple[float, dict]] = {}
 
 
-# ------------------------------ HELPERS --------------------------------------
-def safe_num(value: Any) -> Optional[float]:
-    if value is None or isinstance(value, bool):
+# ----------------------------------------------------------------------------
+# SMALL HELPERS
+# ----------------------------------------------------------------------------
+def num(x: Any) -> Optional[float]:
+    """Safe float. Returns None if missing/invalid. Never invents data."""
+    if x is None or isinstance(x, bool):
         return None
     try:
-        result = float(value)
-        return result if math.isfinite(result) else None
-    except (TypeError, ValueError, OverflowError):
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except (TypeError, ValueError):
         return None
 
 
-def safe_int(value: Any) -> Optional[int]:
+def dig(d: Any, *keys: str) -> Any:
+    """Nested dict getter that returns None instead of raising."""
+    for k in keys:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(k)
+    return d
+
+
+_SUB = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+
+
+def format_price(n: Optional[float]) -> str:
+    """$0.00445 | $0.0₅123 | $1.23 | $42.3K | $395M | $1.2B. None -> N/A."""
+    n = num(n)
+    if n is None:
+        return "N/A"
+    if n == 0:
+        return "$0"
+    neg = n < 0
+    n = abs(n)
+    sign = "-" if neg else ""
+
+    for div, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if n >= div:
+            s = f"{n / div:.1f}".rstrip("0").rstrip(".")
+            return f"{sign}${s}{suffix}"
+    if n >= 1:
+        return f"{sign}${n:,.2f}"
+
+    zeros = int(-math.floor(math.log10(n))) - 1  # leading zeros after "0."
+    if zeros >= 4:
+        digits = f"{n:.{zeros + 3}f}"[2 + zeros:]
+        return f"{sign}$0.0{str(zeros).translate(_SUB)}{digits}"
+    return f"{sign}${n:.{zeros + 3}f}"
+
+
+def fmt_pct(p: Optional[float]) -> str:
+    p = num(p)
+    if p is None:
+        return "N/A"
+    return f"{p:+.1f}%" if abs(p) < 1000 else f"{p:+,.0f}%"
+
+
+def fmt_age(sec: Optional[float]) -> str:
+    if sec is None:
+        return "N/A"
+    sec = max(0, int(sec))
+    if sec < 3600:
+        return f"{max(1, sec // 60)}m"
+    if sec < 86400:
+        return f"{sec // 3600}h {(sec % 3600) // 60}m"
+    return f"{sec // 86400}d"
+
+
+def fmt_int(n: Optional[float]) -> str:
+    n = num(n)
+    return "N/A" if n is None else f"{int(n):,}"
+
+
+def short_addr(a: str) -> str:
+    return f"{a[:4]}...{a[-4:]}" if len(a) > 10 else a
+
+
+def esc(s: Any) -> str:
+    return html.escape(str(s), quote=True)
+
+
+# ----------------------------------------------------------------------------
+# DATA
+# ----------------------------------------------------------------------------
+def parse_pair(pair: dict, address: str, now: Optional[float] = None) -> dict:
+    """Normalize a raw DexScreener pair. Missing fields stay None."""
+    now = now or time.time()
+
+    created_ms = num(pair.get("pairCreatedAt"))
+    created_ts = created_ms / 1000 if created_ms else None  # ms -> s
+    age_sec = (now - created_ts) if created_ts else None
+
+    info = pair.get("info") or {}
+    websites = [w for w in (info.get("websites") or []) if isinstance(w, dict) and w.get("url")]
+    socials = [s for s in (info.get("socials") or []) if isinstance(s, dict) and s.get("url")]
+
+    def has_social(kind: str, domains: tuple) -> bool:
+        for s in socials:
+            if str(s.get("type", "")).lower() == kind:
+                return True
+            if any(dm in str(s.get("url", "")).lower() for dm in domains):
+                return True
+        return False
+
+    d = {
+        "address": address,
+        "name": dig(pair, "baseToken", "name"),
+        "symbol": dig(pair, "baseToken", "symbol"),
+        "dex": pair.get("dexId"),
+        "pair": pair.get("pairAddress"),
+        "url": pair.get("url"),
+        "price": num(pair.get("priceUsd")),
+        "fdv": num(pair.get("fdv")),
+        "mc": num(pair.get("marketCap")),
+        "liq": num(dig(pair, "liquidity", "usd")),
+        "vol24": num(dig(pair, "volume", "h24")),
+        "chg24": num(dig(pair, "priceChange", "h24")),
+        "chg1h": num(dig(pair, "priceChange", "h1")),
+        "buys24": num(dig(pair, "txns", "h24", "buys")),
+        "sells24": num(dig(pair, "txns", "h24", "sells")),
+        "buys1h": num(dig(pair, "txns", "h1", "buys")),
+        "sells1h": num(dig(pair, "txns", "h1", "sells")),
+        "created_ts": created_ts,
+        "age_sec": age_sec,
+        "has_x": has_social("twitter", ("twitter.com", "x.com")),
+        "has_tg": has_social("telegram", ("t.me", "telegram")),
+        "has_web": bool(websites),
+        "dex_paid": bool(websites or socials),  # proxy: DexScreener info exists
+    }
+    d["coverage"] = _coverage(d)
+    return d
+
+
+def _coverage(d: dict) -> float:
+    core = ["price", "fdv", "mc", "liq", "vol24", "chg24", "buys24", "sells24", "created_ts", "dex"]
+    return sum(d[k] is not None for k in core) / len(core)
+
+
+def aggregate_pairs(pairs: list, address: str, now: Optional[float] = None) -> dict:
+    """
+    One token usually trades in many pools. Combine them so big tokens
+    don't look 'thin' because we picked a tiny pool.
+    - price / change / dex / links: from the most active pair (highest 24h vol)
+    - liquidity, volume, txns: summed across pairs
+    - MC / FDV: token-level, taken from the primary pair (fallback: any pair)
+    - age: oldest pair; socials: any pair that has them
+    """
+    now = now or time.time()
+    parsed = [parse_pair(p, address, now) for p in pairs]
+    primary = max(parsed, key=lambda x: (x["vol24"] or 0, x["liq"] or 0))
+    d = dict(primary)
+
+    def total(k: str) -> Optional[float]:
+        vals = [x[k] for x in parsed if x[k] is not None]
+        return sum(vals) if vals else None
+
+    for k in ("liq", "vol24", "buys24", "sells24", "buys1h", "sells1h"):
+        d[k] = total(k)
+    for k in ("mc", "fdv"):
+        if d[k] is None:
+            d[k] = next((x[k] for x in parsed if x[k] is not None), None)
+
+    created = [x["created_ts"] for x in parsed if x["created_ts"]]
+    if created:
+        d["created_ts"] = min(created)
+        d["age_sec"] = now - d["created_ts"]
+    for k in ("has_x", "has_tg", "has_web", "dex_paid"):
+        d[k] = any(x[k] for x in parsed)
+
+    d["pairs"] = len(parsed)
+    d["coverage"] = _coverage(d)
+    return d
+
+
+async def fetch_token_data(address: str) -> Optional[dict]:
+    """Call DexScreener, pick the best Solana pair, return normalized dict or None."""
+    now = time.time()
+    hit = _cache.get(address)
+    if hit and now - hit[0] < CACHE_TTL:
+        return hit[1]
+
+    pairs = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(DEX_URL.format(address))
+                r.raise_for_status()
+                pairs = (r.json() or {}).get("pairs")
+            break
+        except Exception as e:  # network, HTTP, JSON - never crash
+            log.warning("DexScreener attempt %s failed for %s: %s", attempt + 1, address, e)
+            await asyncio.sleep(0.5)
+
+    if not pairs or not isinstance(pairs, list):
+        return None
+
     try:
-        if value is None or isinstance(value, bool):
+        sol = [p for p in pairs if isinstance(p, dict) and p.get("chainId") == "solana"]
+        if not sol:
             return None
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
+        own = [p for p in sol if dig(p, "baseToken", "address") == address]
+        if own:
+            data = aggregate_pairs(own, address)
+        else:  # address only appears as a quote token: use the single most active pair
+            best = max(sol, key=lambda p: num(dig(p, "volume", "h24")) or 0)
+            data = aggregate_pairs([best], address)
+    except Exception as e:
+        log.exception("parse failure for %s: %s", address, e)
         return None
 
-
-def nested(data: Any, *keys: str) -> Any:
-    for key in keys:
-        if not isinstance(data, dict):
-            return None
-        data = data.get(key)
+    if len(_cache) >= CACHE_MAX:
+        _cache.clear()
+    _cache[address] = (now, data)
     return data
 
 
-def esc(value: Any) -> str:
-    return html.escape(str(value), quote=True)
-
-
-def short_addr(address: str) -> str:
-    return f"{address[:6]}...{address[-6:]}" if len(address) > 14 else address
-
-
-def money(value: Optional[float]) -> str:
-    value = safe_num(value)
-    if value is None:
-        return "N/A"
-    sign = "-" if value < 0 else ""
-    value = abs(value)
-    for divisor, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if value >= divisor:
-            return f"{sign}${value / divisor:.2f}{suffix}"
-    if value == 0:
-        return "$0"
-    if value < 0.0001:
-        return f"{sign}${value:.10f}".rstrip("0").rstrip(".")
-    if value < 1:
-        return f"{sign}${value:.8f}".rstrip("0").rstrip(".")
-    return f"{sign}${value:,.2f}"
-
-
-def pct(value: Optional[float]) -> str:
-    value = safe_num(value)
-    return "N/A" if value is None else f"{value:+.1f}%"
-
-
-def age_text(seconds: Optional[float]) -> str:
-    if seconds is None:
-        return "N/A"
-    seconds = max(0, int(seconds))
-    if seconds < 3600:
-        return f"{max(1, seconds // 60)}m"
-    if seconds < 86400:
-        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
-    return f"{seconds // 86400}d"
-
-
-def utc_text(timestamp: Optional[int]) -> str:
-    if not timestamp:
-        return "N/A"
-    return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%d %b %Y %H:%M UTC")
-
-
-def fmt_count(value: Optional[int]) -> str:
-    return "N/A" if value is None else f"{value:,}"
-
-
-def ratio_text(numerator: Optional[float], denominator: Optional[float]) -> str:
-    if numerator is None or denominator is None or denominator <= 0:
-        return "N/A"
-    return f"{numerator / denominator:.2f}x"
-
-
-# ------------------------------ DATABASE -------------------------------------
-def db_connect() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH, timeout=20)
-    db.execute("PRAGMA journal_mode=WAL")
-    return db
-
-
-def init_db() -> None:
-    with db_connect() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS first_seen (
-                mint TEXT PRIMARY KEY,
-                first_seen INTEGER NOT NULL,
-                first_price REAL,
-                first_mc REAL
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                mint TEXT NOT NULL,
-                ts INTEGER NOT NULL,
-                price REAL,
-                fdv REAL,
-                mc REAL
-            )
-        """)
-        # Add mc to older databases without destroying existing history.
-        columns = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
-        if "mc" not in columns:
-            db.execute("ALTER TABLE snapshots ADD COLUMN mc REAL")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_mint_ts ON snapshots(mint, ts)")
-
-
-def record_snapshot(mint: str, price: Optional[float], fdv: Optional[float], mc: Optional[float]) -> None:
-    now = int(time.time())
-    with db_connect() as db:
-        db.execute(
-            "INSERT OR IGNORE INTO first_seen(mint, first_seen, first_price, first_mc) VALUES(?,?,?,?)",
-            (mint, now, price, mc if mc is not None else fdv),
-        )
-        db.execute(
-            "INSERT INTO snapshots(mint, ts, price, fdv, mc) VALUES(?,?,?,?,?)",
-            (mint, now, price, fdv, mc),
-        )
-        db.execute("DELETE FROM snapshots WHERE ts < ?", (now - 30 * 86400,))
-
-
-def tracking_data(mint: str) -> dict[str, Any]:
-    now = int(time.time())
-    with db_connect() as db:
-        first = db.execute(
-            "SELECT first_seen, first_price, first_mc FROM first_seen WHERE mint=?", (mint,)
-        ).fetchone()
-        ath = db.execute(
-            "SELECT MAX(price), MAX(fdv), MAX(mc) FROM snapshots WHERE mint=?", (mint,)
-        ).fetchone()
-        old = db.execute(
-            "SELECT price, fdv, mc, ts FROM snapshots WHERE mint=? AND ts<=? ORDER BY ts DESC LIMIT 1",
-            (mint, now - 23 * 3600),
-        ).fetchone()
-    return {"first": first, "ath_price": ath[0] if ath else None,
-            "ath_fdv": ath[1] if ath else None, "ath_mc": ath[2] if ath else None,
-            "old_24h": old}
-
-
-# ------------------------------ HTTP / API -----------------------------------
-async def request_json(method: str, url: str, **kwargs: Any) -> Any:
-    global _http
-    if _http is None:
-        raise RuntimeError("HTTP client is not initialized")
-    last_error = None
-    for attempt in range(2):
-        try:
-            response = await _http.request(method, url, **kwargs)
-            response.raise_for_status()
-            return response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            last_error = exc
-            if attempt == 0:
-                await asyncio.sleep(0.5)
-    raise RuntimeError(f"API request failed: {last_error}")
-
-
-async def helius_rpc(method: str, params: Any) -> Any:
-    if not HELIUS_KEY:
-        return None
-    result = await request_json(
-        "POST", HELIUS_RPC_URL,
-        params={"api-key": HELIUS_KEY},
-        json={"jsonrpc": "2.0", "id": "jabir-runner", "method": method, "params": params},
-    )
-    if result.get("error"):
-        raise RuntimeError(str(result["error"]))
-    return result.get("result")
-
-
-async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
-    now = time.time()
-    cached = _cache.get(mint)
-    if cached and now - cached[0] < CACHE_TTL:
-        return cached[1]
-
-    payload = await request_json("GET", DEX_TOKEN_URL.format(mint))
-    pairs = payload.get("pairs") or []
-    solana_pairs = [p for p in pairs if isinstance(p, dict) and p.get("chainId") == "solana"]
-    # Do not silently scan a quote-token pair and mislabel its base token as the requested mint.
-    matching = [
-        p for p in solana_pairs
-        if str(nested(p, "baseToken", "address") or "").lower() == mint.lower()
-    ]
-    if not matching:
-        return None
-    best = max(matching, key=lambda p: safe_num(nested(p, "liquidity", "usd")) or 0.0)
-
-    if len(_cache) >= CACHE_MAX:
-        expired = [key for key, (stamp, _) in _cache.items() if now - stamp >= CACHE_TTL]
-        for key in expired:
-            _cache.pop(key, None)
-        if len(_cache) >= CACHE_MAX:
-            _cache.pop(next(iter(_cache)))
-    _cache[mint] = (now, best)
-    return best
-
-
-async def fetch_paid_status(mint: str) -> Optional[bool]:
-    try:
-        orders = await request_json("GET", DEX_ORDERS_URL.format(mint))
-        if not isinstance(orders, list):
-            return None
-        return any(
-            isinstance(order, dict) and order.get("status") == "approved"
-            for order in orders
-        )
-    except Exception as exc:
-        log.warning("Dex paid status unavailable for %s: %s", mint, exc)
-        return None
-
-
-async def fetch_supply(mint: str) -> Optional[dict[str, Any]]:
-    result = await helius_rpc("getTokenSupply", [mint, {"commitment": "confirmed"}])
-    if not result:
-        return None
-    value = result.get("value") or {}
-    raw = safe_int(value.get("amount"))
-    decimals = safe_int(value.get("decimals"))
-    if raw is None or decimals is None:
-        return None
-    return {"raw": raw, "decimals": decimals, "ui_amount": safe_num(value.get("uiAmount"))}
-
-
-async def fetch_authorities(mint: str) -> Optional[dict[str, Any]]:
-    result = await helius_rpc(
-        "getAccountInfo",
-        [mint, {"encoding": "base64", "commitment": "confirmed"}],
-    )
-    value = (result or {}).get("value")
-    if not value:
-        return None
-    account_data = value.get("data")
-    if not isinstance(account_data, list) or not account_data:
-        return None
-    try:
-        raw = base64.b64decode(account_data[0])
-    except Exception:
-        return None
-    # Standard SPL Token mint layout only. Token-2022 extension layouts are not fully decoded here.
-    if len(raw) < 82:
-        return None
-
-    def authority(option_offset: int, key_offset: int) -> Optional[str]:
-        option = int.from_bytes(raw[option_offset:option_offset + 4], "little")
-        return raw[key_offset:key_offset + 32].hex() if option == 1 else None
-
+async def get_security_data(address: str) -> dict:
+    """
+    PLACEHOLDER. Plug Helius in here later (bundle %, dev holding, top 10, holders).
+    Keep the same keys so build_report() needs no changes.
+    Return real values only - never guess.
+    """
+    # TODO(Helius): e.g. getTokenLargestAccounts / DAS getAsset / enhanced txs
     return {
-        "mint_authority_active": authority(0, 4) is not None,
-        "freeze_authority_active": authority(46, 50) is not None,
-        "token_program": value.get("owner"),
-        "layout": "standard SPL",
+        "bundled": "N/A (Helius coming)",
+        "dev": "N/A",
+        "fake_holders": "N/A",
+        "top10": "N/A",
+        "holders": "N/A",
     }
 
 
-async def fetch_holders(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
-    if not HELIUS_KEY or supply_raw <= 0:
+# ----------------------------------------------------------------------------
+# LOGIC
+# ----------------------------------------------------------------------------
+def _buy_ratio(d: dict) -> Optional[float]:
+    b, s = d.get("buys24"), d.get("sells24")
+    if b is None or s is None or (b + s) == 0:
         return None
-    cursor = None
-    all_accounts: list[dict[str, Any]] = []
-    reported_total = None
-
-    for page in range(MAX_HOLDER_PAGES):
-        params: dict[str, Any] = {
-            "mint": mint, "limit": HOLDER_PAGE_SIZE,
-            "options": {"showZeroBalance": False},
-        }
-        if cursor:
-            params["cursor"] = cursor
-        result = await helius_rpc("getTokenAccounts", params)
-        if not result:
-            break
-        if reported_total is None:
-            reported_total = safe_int(result.get("total"))
-        accounts = result.get("token_accounts") or []
-        all_accounts.extend(a for a in accounts if isinstance(a, dict))
-        cursor = result.get("cursor")
-        if not cursor or not accounts:
-            break
-
-    if not all_accounts:
-        return None
-
-    # Exact integer aggregation avoids float precision loss in raw token amounts.
-    owner_amounts: dict[str, int] = {}
-    for account in all_accounts:
-        owner = account.get("owner")
-        amount = safe_int(account.get("amount"))
-        if owner and amount and amount > 0:
-            owner_amounts[owner] = owner_amounts.get(owner, 0) + amount
-
-    ranked = sorted(owner_amounts.items(), key=lambda item: item[1], reverse=True)
-    complete = reported_total is not None and len(all_accounts) >= reported_total
-    top10 = (sum(amount for _, amount in ranked[:10]) / supply_raw * 100) if complete else None
-    top_five = [f"{amount / supply_raw * 100:.1f}%" for _, amount in ranked[:5]]
-    return {
-        "holder_count": len(owner_amounts) if complete else None,
-        "top10_percent": top10,
-        "top_five": top_five,
-        "complete": complete,
-        "accounts_scanned": len(all_accounts),
-        "reported_accounts": reported_total,
-    }
+    return b / (b + s)
 
 
-def socials_from_pair(pair: dict[str, Any]) -> dict[str, bool]:
-    info = pair.get("info") or {}
-    websites = [x for x in (info.get("websites") or []) if isinstance(x, dict)]
-    socials = [x for x in (info.get("socials") or []) if isinstance(x, dict)]
-    all_text = [
-        " ".join(str(x.get(k, "")) for k in ("type", "platform", "url", "handle")).lower()
-        for x in socials
-    ]
-    x_found = any("twitter" in x or "x.com" in x for x in all_text)
-    tg_found = any("telegram" in x or "t.me" in x for x in all_text)
-    web_found = bool(websites)
-    return {"x": x_found, "web": web_found, "tg": tg_found}
-
-
-async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
-    pair = await fetch_pair(mint)
-    if not pair:
-        raise ValueError("Ba a samu Solana pair da mint ɗin yake base token ba.")
-
-    base = pair.get("baseToken") or {}
-    volume = pair.get("volume") or {}
-    changes = pair.get("priceChange") or {}
-    txns = pair.get("txns") or {}
-    h1, h24 = txns.get("h1") or {}, txns.get("h24") or {}
-
-    price = safe_num(pair.get("priceUsd"))
-    fdv = safe_num(pair.get("fdv"))
-    mc = safe_num(pair.get("marketCap"))
-    liq = safe_num(nested(pair, "liquidity", "usd"))
-    created_ms = safe_num(pair.get("pairCreatedAt"))
-    created_ts = created_ms / 1000 if created_ms else None
-    now = time.time()
-    age_sec = now - created_ts if created_ts else None
-
-    # Track only values actually observed by this bot. ATH is since first scan, not lifetime ATH.
-    await asyncio.to_thread(record_snapshot, mint, price, fdv, mc)
-    tracking = await asyncio.to_thread(tracking_data, mint)
-    old = tracking.get("old_24h")
-    fdv_change_24h = None
-    if old and old[1] and fdv is not None and old[1] > 0:
-        fdv_change_24h = (fdv / old[1] - 1) * 100
-
-    socials = socials_from_pair(pair)
-    # Market scan always gets paid status; deep scan also requests on-chain detail.
-    paid_task = fetch_paid_status(mint)
-    supply_task = fetch_supply(mint) if HELIUS_KEY else asyncio.sleep(0, result=None)
-    authorities_task = fetch_authorities(mint) if HELIUS_KEY else asyncio.sleep(0, result=None)
-    paid, supply, authorities = await asyncio.gather(
-        paid_task, supply_task, authorities_task, return_exceptions=True
-    )
-    if isinstance(paid, Exception):
-        log.warning("Paid lookup failed: %s", paid)
-        paid = None
-    if isinstance(supply, Exception):
-        log.warning("Supply lookup failed: %s", supply)
-        supply = None
-    if isinstance(authorities, Exception):
-        log.warning("Authority lookup failed: %s", authorities)
-        authorities = None
-
-    holders = None
-    if deep and supply:
-        try:
-            holders = await fetch_holders(mint, supply["raw"])
-        except Exception as exc:
-            log.warning("Holder lookup failed: %s", exc)
-
-    first = tracking.get("first")
-    ath_price = tracking.get("ath_price")
-    ath_distance = ((price / ath_price) - 1) * 100 if price and ath_price and ath_price > 0 else None
-
-    return {
-        "mint": mint,
-        "name": base.get("name") or "Unknown",
-        "symbol": base.get("symbol") or "?",
-        "price": price, "liquidity": liq,
-        "volume24": safe_num(volume.get("h24")),
-        "fdv": fdv, "mc": mc,
-        "price_change_1h": safe_num(changes.get("h1")),
-        "price_change_24h": safe_num(changes.get("h24")),
-        "buys1h": safe_int(h1.get("buys")), "sells1h": safe_int(h1.get("sells")),
-        "buys24": safe_int(h24.get("buys")), "sells24": safe_int(h24.get("sells")),
-        "dex": pair.get("dexId") or "N/A",
-        "pair": pair.get("pairAddress"),
-        "url": pair.get("url") or f"https://dexscreener.com/solana/{mint}",
-        "created_ts": created_ts, "age_sec": age_sec,
-        "ath_price": ath_price, "ath_distance": ath_distance,
-        "fdv_change_24h": fdv_change_24h,
-        "supply": supply, "authorities": authorities, "holders": holders,
-        "socials": socials, "dex_paid": paid,
-        "first_seen": first[0] if first else None,
-        "first_price": first[1] if first else None,
-        "first_mc": first[2] if first else None,
-        "pair_data": pair,
-    }
-
-
-# ------------------------------ RISK / NARRATIVE ------------------------------
-def buy_ratio(data: dict[str, Any]) -> Optional[float]:
-    buys, sells = data.get("buys24"), data.get("sells24")
-    if buys is None or sells is None or buys + sells <= 0:
-        return None
-    return buys / (buys + sells)
-
-
-def market_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
+def _risk_flags(d: dict) -> list[tuple[str, str]]:
+    """Inferred risk from DexScreener data only. Returns [(level, text)]."""
     flags: list[tuple[str, str]] = []
-    liq, vol = data.get("liquidity"), data.get("volume24")
-    mc = data.get("mc") or data.get("fdv")
-    age = data.get("age_sec")
+    liq, vol, age = d["liq"], d["vol24"], d["age_sec"]
+    mc_ref = d["mc"] if d["mc"] is not None else d["fdv"]
+
     if liq is not None and liq < 10_000:
-        flags.append(("HIGH", "Liquidity below $10K"))
-    if liq is not None and mc and mc >= 100_000 and liq / mc < 0.02:
-        flags.append(("HIGH", f"LP/MC very thin ({liq / mc * 100:.1f}%)"))
-    elif liq is not None and mc and mc >= 100_000 and liq / mc < 0.05:
-        flags.append(("MEDIUM", f"LP/MC thin ({liq / mc * 100:.1f}%)"))
+        flags.append(("red", "Liq under $10K"))
+    # LP/MC ratio only matters for small/mid caps; large caps normally have low ratios
+    if liq is not None and mc_ref and 100_000 <= mc_ref <= 50_000_000:
+        if liq / mc_ref < 0.02:
+            flags.append(("red", f"Liq only {liq / mc_ref * 100:.1f}% of MC"))
+        elif liq / mc_ref < 0.05:
+            flags.append(("yellow", f"Thin liq ({liq / mc_ref * 100:.1f}% of MC)"))
     if age is not None and age < 3600:
-        flags.append(("MEDIUM", "Pair younger than 1 hour"))
-    if vol is not None and mc and vol > mc * 5:
-        flags.append(("MEDIUM", "24h volume exceeds 5x MC; verify wash-trading risk"))
-    if vol is not None and data.get("fdv") and data["fdv"] > 0 and vol < data["fdv"] * 0.01:
-        flags.append(("MEDIUM", "Volume is thin versus FDV"))
-    ratio = buy_ratio(data)
-    tx_total = (data.get("buys24") or 0) + (data.get("sells24") or 0)
-    if ratio is not None and tx_total >= 100 and ratio < 0.40:
-        flags.append(("MEDIUM", "Heavy sell pressure"))
+        flags.append(("yellow", "Brand new pair (<1h)"))
+    if vol is not None and mc_ref and vol > mc_ref * 5:
+        flags.append(("yellow", "Vol 5x+ MC (wash/pump?)"))
+    if vol is not None and d["fdv"] and vol < d["fdv"] * 0.01:
+        flags.append(("yellow", "Thin vol vs FDV"))
+    r = _buy_ratio(d)
+    if r is not None and (d["buys24"] + d["sells24"]) >= 100 and r < 0.40:
+        flags.append(("yellow", "Heavy sell pressure"))
     return flags
 
 
-def security_assessment(data: dict[str, Any]) -> dict[str, Any]:
-    authorities = data.get("authorities") or {}
-    holders = data.get("holders") or {}
-    flags: list[str] = []
-    if authorities.get("mint_authority_active") is True:
-        flags.append("Mint authority active")
-    if authorities.get("freeze_authority_active") is True:
-        flags.append("Freeze authority active")
-    top10 = holders.get("top10_percent")
-    if top10 is not None and top10 >= 50:
-        flags.append(f"Top 10 wallets hold {top10:.1f}% (partial holder data checked)")
-    # Bundle/dev/sniper/fake-holder metrics are not computed by this code.
-    # Do not present them as zero or claim those risks were cleared.
+def _risk_line(d: dict, force_red: Optional[str] = None) -> str:
+    flags = _risk_flags(d)
+    if force_red:
+        return f"🔴 {force_red}"
+    if any(lv == "red" for lv, _ in flags):
+        txt = " · ".join(t for lv, t in flags if lv == "red")
+        return f"🔴 {txt}"
     if flags:
-        level = "HIGH"
-    elif not authorities or (data.get("holders") is None):
-        level = "UNKNOWN"
-    else:
-        level = "UNASSESSED"
-    return {"level": level, "flags": flags}
+        return "🟡 " + " · ".join(t for _, t in flags[:2])
+    return "🟢 No red flags in market data (bundles/holders unchecked)"
 
 
-def verdict(data: dict[str, Any]) -> tuple[str, str]:
-    liq, vol = data.get("liquidity"), data.get("volume24")
-    mc = data.get("mc") or data.get("fdv")
-    chg, age = data.get("price_change_24h"), data.get("age_sec")
-    flags = market_flags(data)
-    security = security_assessment(data)
+def calculate_verdict(d: dict) -> tuple[str, str, str]:
+    """Returns (risk, verdict, reason). Risk/verdict strings include emoji."""
+    liq, vol, chg, age = d["liq"], d["vol24"], d["chg24"], d["age_sec"]
+    mc_ref = d["mc"] if d["mc"] is not None else d["fdv"]  # FDV only as fallback for logic
 
-    if liq is not None and mc is not None and liq < 10_000 and mc > 100_000:
-        return "🔴 AVOID", "Low liquidity relative to valuation"
-    if any(level == "HIGH" for level, _ in flags) or security["level"] == "HIGH":
-        return "🟡 WATCH", "High-risk warning detected; inspect the flags"
-    if age is not None and age < 3600 and vol is not None and mc and vol > mc * 2:
-        return "🟡 WATCH", "Very new pair with unusually high volume"
-    if chg is not None and chg > 100 and liq is not None and vol is not None and vol > liq:
-        return "🟡 WATCH", "Potentially overheated; wait for confirmation"
-    # No BUY verdict: security attribution and a validated entry strategy are not implemented.
-    missing = []
-    if not HELIUS_KEY:
-        missing.append("Helius key missing")
-    if security["level"] == "UNKNOWN":
-        missing.append("on-chain checks incomplete")
-    if data.get("buys24") is None or data.get("sells24") is None:
-        missing.append("transaction data incomplete")
-    reason = "No automatic BUY signal. " + (", ".join(missing) if missing else "Use a separately tested strategy.")
-    return "🟡 WATCH", reason
+    # 1) Low liquidity trap
+    if liq is not None and mc_ref is not None and liq < 10_000 and mc_ref > 100_000:
+        reason = f"Low liquidity trap (LP {format_price(liq)} vs MC {format_price(mc_ref)})"
+        return _risk_line(d, force_red="Low liquidity trap"), "🔴 AVOID", reason
 
+    # 2) New + volume way above MC
+    if age is not None and vol is not None and mc_ref is not None and age < 3600 and vol > mc_ref * 2:
+        return _risk_line(d), "🟡 WATCH", "Possible wash / pump (vol > 2x MC, under 1h old)"
 
-async def groq_narrative(data: dict[str, Any]) -> str:
-    if not GROQ_KEY:
-        return "AI narrative: N/A (GROQ_API_KEY missing)"
-    prompt_data = {
-        "name": data["name"], "ticker": data["symbol"], "dex": data["dex"],
-        "pair_age": age_text(data["age_sec"]),
-        "price_change_1h": data["price_change_1h"],
-        "price_change_24h": data["price_change_24h"],
-        "liquidity_usd": data["liquidity"], "volume_24h_usd": data["volume24"],
-        "social_links_present": data["socials"],
-    }
-    prompt = (
-        "Write exactly two short lines in natural Hausa. First: describe only what "
-        "the supplied token name/symbol and links suggest, and clearly say if the "
-        "project identity is not verified. Second: summarize market attention or "
-        "weak evidence from the supplied figures. Do not invent utility, team, "
-        "partnerships, community, news, followers, or adoption. Do not advise buying "
-        "or selling. Data: " + json.dumps(prompt_data, ensure_ascii=False)
-    )
-    try:
-        result = await request_json(
-            "POST", GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": "Return only two concise Hausa lines. No unsupported claims."},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.2, "max_tokens": 130,
-            },
-        )
-        content = result["choices"][0]["message"]["content"].strip()
-        lines = [line.strip() for line in content.splitlines() if line.strip()]
-        return "\n".join(lines[:2]) if lines else "AI narrative: N/A"
-    except Exception as exc:
-        log.warning("Groq narrative failed: %s", exc)
-        return "AI narrative: N/A (Groq request failed)"
+    # 3) Overheated
+    if chg is not None and liq is not None and vol is not None and chg > 100 and liq < vol:
+        return _risk_line(d), "🟡 WATCH", f"Overheated ({fmt_pct(chg)} 24h, vol > liq)"
+
+    # 4) Not enough data
+    if d["coverage"] < 0.5:
+        return "🟡 Too little data to judge", "⚪ NEED MORE DATA", f"Only {d['coverage'] * 100:.0f}% of fields available"
+
+    # 5) Momentum
+    risk = _risk_line(d)
+    ratio = _buy_ratio(d)
+    if (
+        not risk.startswith("🔴")
+        and chg is not None and chg > 0
+        and ratio is not None and ratio >= 0.55
+        and liq is not None and liq >= 25_000
+        and age is not None and age >= 3600
+    ):
+        return risk, "🟢 BUY", f"Up {fmt_pct(chg)}, {ratio * 100:.0f}% buys, LP {format_price(liq)}"
+
+    parts = [f"24h {fmt_pct(chg)}"]
+    if ratio is not None:
+        parts.append(f"{ratio * 100:.0f}% buys")
+    if liq is not None and liq < 25_000:
+        parts.append(f"LP {format_price(liq)}")
+    if age is not None and age < 3600:
+        parts.append("under 1h old")
+    return risk, "🟡 WATCH", "No momentum confirmation (" + ", ".join(parts) + ")"
 
 
-# ------------------------------ REPORT / UI ----------------------------------
-def yes_no(value: Optional[bool]) -> str:
-    return "✅" if value is True else "❌" if value is False else "N/A"
+def _narrative(d: dict) -> str:
+    """Max 2 lines. Built only from available data - no invented story."""
+    name = esc((d["name"] or "Unknown")[:24])
+    dex = esc((d["dex"] or "N/A").capitalize())
+    links = [lbl for lbl, ok in (("X", d["has_x"]), ("Web", d["has_web"]), ("TG", d["has_tg"])) if ok]
+    line1 = f"{name} on {dex}, {fmt_age(d['age_sec'])} old; " + (
+        "links: " + "/".join(links) if links else "no socials listed"
+    ) + "."
+
+    mc_ref = d["mc"] if d["mc"] is not None else d["fdv"]
+    ratio = _buy_ratio(d)
+    heat = []
+    if d["vol24"] is not None and mc_ref:
+        heat.append(f"vol {d['vol24'] / mc_ref:.1f}x MC")
+    if ratio is not None:
+        heat.append(f"{ratio * 100:.0f}% buys 24h")
+    line2 = ("Heat: " + ", ".join(heat) + ".") if heat else "Not enough data to judge the story."
+    return f"{line1}\n{line2}"
 
 
-def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
-    security = security_assessment(data)
-    market = market_flags(data)
-    verdict_text, verdict_reason = verdict(data)
-    supply = data.get("supply") or {}
-    holders = data.get("holders") or {}
-    authorities = data.get("authorities") or {}
-    socials = data["socials"]
+def build_report(data: dict, sec: Optional[dict] = None) -> str:
+    """Exact output format, 20 non-blank lines. HTML parse mode."""
+    sec = sec or {}
+    sym = esc((data["symbol"] or "???").upper())
+    name = esc((data["name"] or "Unknown")[:24])
+    dex = esc((data["dex"] or "N/A").capitalize())
+    risk, verdict, reason = calculate_verdict(data)
 
-    mc_value = data.get("mc")
-    mc_text = money(mc_value) if mc_value is not None else (
-        f"N/A (FDV {money(data.get('fdv'))})" if data.get("fdv") is not None else "N/A"
-    )
-    ath_text = "N/A (tracked since bot's first scan)"
-    if data.get("ath_price") is not None and data.get("ath_distance") is not None:
-        ath_text = f"{money(data['ath_price'])} ({data['ath_distance']:+.1f}% from tracked high)"
-    top10 = holders.get("top10_percent")
-    top10_text = f"{top10:.1f}%" if top10 is not None else "N/A"
-    holder_count = holders.get("holder_count")
-    top_five = "|".join(holders.get("top_five") or []) or "N/A"
+    mc_txt = format_price(data["mc"])
+    if data["mc"] is None and data["fdv"] is not None:
+        mc_txt = f"N/A (FDV {format_price(data['fdv'])})"
 
-    mint_auth = "ACTIVE" if authorities.get("mint_authority_active") is True else (
-        "REVOKED" if authorities and authorities.get("mint_authority_active") is False else "N/A"
-    )
-    freeze_auth = "ACTIVE" if authorities.get("freeze_authority_active") is True else (
-        "REVOKED" if authorities and authorities.get("freeze_authority_active") is False else "N/A"
-    )
-    paid_text = yes_no(data.get("dex_paid"))
-    market_text = "; ".join(text for _, text in market[:3]) if market else "No market flags detected"
-    security_text = "; ".join(security["flags"]) if security["flags"] else (
-        "No authority/holder flag detected; bundle/dev/sniper checks unavailable"
-    )
+    b1, s1 = data["buys1h"], data["sells1h"]
+    x = "✅" if data["has_x"] else "❌"
+    w = "✅" if data["has_web"] else "❌"
+    t = "✅" if data["has_tg"] else "❌"
 
-    pair = data.get("pair") or data["mint"]
-    chart_url = f"https://dexscreener.com/solana/{pair}"
-    photon_url = f"https://photon-sol.tinyastro.io/en/lp/{pair}"
-    solscan_url = f"https://solscan.io/token/{data['mint']}"
-    dex_url = data.get("url") or chart_url
+    addr = data["address"]
+    pair = data["pair"] or addr
+    chart = f"https://dexscreener.com/solana/{pair}"
+    dex_link = data["url"] or f"https://dexscreener.com/solana/{addr}"
+    photon = f"https://photon-sol.tinyastro.io/en/lp/{pair}"
 
     lines = [
-        f"🚀 <b>JABIR RUNNER V2</b> | ${esc(data['symbol'])}",
+        f"🚀 <b>JABIR RUNNER</b> | ${sym}",
         BAR,
-        f"🪙 {esc(data['name'])} | {esc(data['dex'])} | 🌱 {age_text(data['age_sec'])}",
-        f"📍 CA: <code>{esc(short_addr(data['mint']))}</code>",
+        f"🪙 {name} (${sym}) | 🟣 {dex} | 🌱 {fmt_age(data['age_sec'])}",
+        f"📍 CA: <code>{esc(short_addr(addr))}</code>",
         "",
-        "<b>📊 MARKET</b>",
-        f"💰 {money(data['price'])} ({pct(data['price_change_24h'])}) | MC: {mc_text}",
-        f"🏔️ ATH: {ath_text}",
-        f"💧 LP: {money(data['liquidity'])} | Vol 24h: {money(data['volume24'])} | Vol/LP: {ratio_text(data['volume24'], data['liquidity'])}",
-        f"⏱️ 1H: {pct(data['price_change_1h'])} | Buys: {fmt_count(data['buys1h'])} | Sells: {fmt_count(data['sells1h'])}",
-        f"⚡ FDV: {money(data['fdv'])} | Supply: {fmt_count(safe_int(supply.get('ui_amount')))}",
+        "📊 <b>STATS</b>",
+        f"💰 {format_price(data['price'])} ({fmt_pct(data['chg24'])}) | MC: {mc_txt} | ATH: N/A",
+        f"💧 LP: {format_price(data['liq'])} | 📊 Vol: {format_price(data['vol24'])} | "
+        f"1H: {fmt_pct(data['chg1h'])} 🅑{fmt_int(b1)} Ⓢ{fmt_int(s1)}",
         "",
-        f"<b>🧠 NARRATIVE</b>\n{esc(narrative)}",
+        f"🧠 <b>NARRATIVE:</b> {_narrative(data)}",
         "",
-        "<b>🔒 SECURITY</b>",
-        f"├ Mint: {mint_auth} | Freeze: {freeze_auth} | DEX Paid: {paid_text}",
-        f"├ Top 10: {top10_text} | Holders: {fmt_count(holder_count)}",
-        f"├ Top wallets: {esc(top_five)}",
-        f"└ Bundle/Dev/Snipers/Fake holders: N/A (not attributed)",
+        "🔒 <b>SECURITY</b>",
+        f"├ Bundled: {esc(sec.get('bundled', 'N/A (Helius coming)'))} | Dev: {esc(sec.get('dev', 'N/A'))}",
+        f"├ Fake Holders: {esc(sec.get('fake_holders', 'N/A'))} | Top 10: {esc(sec.get('top10', 'N/A'))}",
+        f"└ DEX Paid: {'✅' if data['dex_paid'] else '❌'}",
         "",
-        f"<b>⚠️ MARKET RISK:</b> {esc(market_text)}",
-        f"<b>🛡️ ON-CHAIN:</b> {esc(security['level'])} - {esc(security_text)}",
-        f"<b>🎯 VERDICT:</b> {verdict_text} - {esc(verdict_reason)}",
-        f"🕒 First scan: {utc_text(data.get('first_seen'))} | ATH is bot-tracked only",
-        f"🔗 <a href=\"{esc(chart_url)}\">Chart</a> | <a href=\"{esc(dex_url)}\">DexScreener</a> | <a href=\"{esc(photon_url)}\">Photon</a> | <a href=\"{esc(solscan_url)}\">Solscan</a>",
+        f"👥 <b>HOLDERS:</b> {esc(sec.get('holders', 'N/A'))}",
+        f"🔗 Socials: X {x} • Web {w} • TG {t}",
+        "",
+        f"⚠️ <b>RISK:</b> {esc(risk)}",
+        f"🎯 <b>VERDICT:</b> {verdict} - {esc(reason)}",
+        "",
+        f'🔗 <a href="{esc(chart)}">Chart</a> | <a href="{esc(dex_link)}">DexScreener</a> | '
+        f'<a href="{esc(photon)}">Photon</a>',
         BAR,
-        "<i>JABIR RUNNER | See Beyond The Chart.</i>",
+        "JABIR RUNNER | See Beyond The Chart.",
     ]
     return "\n".join(lines)
 
 
-def report_keyboard(mint: str, pair_url: str, pair_address: Optional[str]) -> InlineKeyboardMarkup:
-    pair_address = pair_address or mint
-    photon = f"https://photon-sol.tinyastro.io/en/lp/{pair_address}"
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{mint}"),
-            InlineKeyboardButton("📈 Chart", url=pair_url),
-            InlineKeyboardButton("🛡️ Deep Scan", callback_data=f"deep:{mint}"),
-        ],
-        [
-            InlineKeyboardButton("DexScreener", url=pair_url),
-            InlineKeyboardButton("Photon", url=photon),
-            InlineKeyboardButton("Solscan", url=f"https://solscan.io/token/{mint}"),
-        ],
-    ])
-
-
-# ------------------------------ TELEGRAM -------------------------------------
+# ----------------------------------------------------------------------------
+# TELEGRAM HANDLERS
+# ----------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    await update.message.reply_text(
-        "🚀 <b>JABIR RUNNER V2</b>\n"
-        "<i>See Beyond The Chart.</i>\n\n"
-        "Turo Solana token Contract Address (CA) domin scan.\n\n"
-        "Quick tests: /testicles /pengu /grokius\n"
-        "Commands: /help",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    await update.message.reply_text(
-        "📖 <b>JABIR RUNNER V2 GUIDE</b>\n\n"
-        "• Turo Solana CA domin scan.\n"
-        "• /testicles, /pengu, /grokius domin gwaji.\n"
-        "• Refresh yana sabunta market data.\n"
-        "• Deep Scan yana ƙoƙarin karanta holder data ta Helius.\n\n"
-        "Muhimmi:\n"
-        "• ATH yana farawa daga lokacin da bot ya fara tracking.\n"
-        "• Bundle/dev/sniper/fake-holder attribution bai gama ginawa ba, don haka N/A ne.\n"
-        "• Ba a fitar da automatic BUY signal. WATCH ba yana nufin token lafiya ba.\n"
-        "• Helius da Groq suna buƙatar API keys nasu.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE,
-                       status_message=None, chat_id: Optional[int] = None,
-                       deep: bool = False) -> None:
     try:
-        if status_message:
-            await status_message.edit_text("🔍 JABIR RUNNER\n\n⏳ Fetching market data...")
-        data = await collect_token_data(mint, deep=deep)
-        if status_message:
-            await status_message.edit_text("🧠 Preparing trader report...")
-        narrative = await groq_narrative(data)
-        report = build_report(data, narrative, deep)
-        keyboard = report_keyboard(mint, data["url"], data.get("pair"))
-        if status_message:
-            await status_message.edit_text(
-                report, parse_mode=ParseMode.HTML,
-                reply_markup=keyboard, disable_web_page_preview=True,
-            )
-        elif chat_id is not None:
-            await context.bot.send_message(
-                chat_id, report, parse_mode=ParseMode.HTML,
-                reply_markup=keyboard, disable_web_page_preview=True,
-            )
-    except ValueError as exc:
-        message = f"❌ {esc(exc)}"
-        if status_message:
-            await status_message.edit_text(message, parse_mode=ParseMode.HTML)
-        elif chat_id is not None:
-            await context.bot.send_message(chat_id, message, parse_mode=ParseMode.HTML)
-    except Exception:
-        log.exception("Scan failed for %s", mint)
-        message = "❌ Scan failed. Duba Render Logs da API keys/configuration."
-        try:
-            if status_message:
-                await status_message.edit_text(message)
-            elif chat_id is not None:
-                await context.bot.send_message(chat_id, message)
-        except Exception:
-            log.exception("Could not send scan failure message")
+        await update.message.reply_text(
+            "🚀 <b>JABIR RUNNER</b>\nPaste a Solana token address (CA) and I'll scan it.\n"
+            "<i>See Beyond The Chart.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.warning("start failed: %s", e)
 
 
 async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message or not message.text:
+    msg = update.message
+    if not msg or not msg.text:
         return
-    match = SOL_ADDR_RE.search(message.text.strip())
-    if not match:
-        return
-    mint = match.group(0)
+    m = SOL_ADDR_RE.search(msg.text)
+    if not m:
+        return  # not a CA, stay quiet in groups
+    address = m.group(0)
+
     try:
-        await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
+        await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
     except Exception:
         pass
-    status = await message.reply_text("🔍 JABIR RUNNER\n\nAn karɓi CA. Ana fara scan...")
-    await perform_scan(mint, context, status_message=status, deep=False)
+
+    try:
+        data = await fetch_token_data(address)
+        if not data:
+            await msg.reply_text(ERR_MSG)
+            return
+        try:
+            sec = await get_security_data(address)
+        except Exception as e:
+            log.warning("security placeholder failed: %s", e)
+            sec = {}
+        report = build_report(data, sec)
+        await msg.reply_text(
+            report,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.exception("handle_ca failed for %s: %s", address, e)
+        try:
+            await msg.reply_text(ERR_MSG)
+        except Exception:
+            pass
 
 
-async def preset_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
-    if not update.message:
-        return
-    status = await update.message.reply_text(f"🔍 Starting {key.upper()} scan...")
-    await perform_scan(TEST_TOKENS[key], context, status_message=status, deep=False)
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Unhandled error: %s", context.error)
 
 
-async def testicles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await preset_scan(update, context, "testicles")
-
-
-async def pengu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await preset_scan(update, context, "pengu")
-
-
-async def grokius_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await preset_scan(update, context, "grokius")
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    raw = query.data or ""
-    if ":" not in raw:
-        return
-    action, mint = raw.split(":", 1)
-    if action not in ("refresh", "deep") or not SOL_ADDR_RE.fullmatch(mint):
-        return
-    await perform_scan(
-        mint, context, status_message=query.message,
-        deep=(action == "deep"),
-    )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.error("Unhandled Telegram error: %s", context.error)
-
-
-async def post_init(application: Application) -> None:
-    global _http
-    _http = httpx.AsyncClient(
-        timeout=httpx.Timeout(20.0, connect=10.0),
-        headers={"User-Agent": "JABIR-RUNNER/2.0"},
-        limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),
-    )
-    await asyncio.to_thread(init_db)
-    log.info("JABIR RUNNER V2 initialized")
-
-
-async def post_shutdown(application: Application) -> None:
-    global _http
-    if _http:
-        await _http.aclose()
-        _http = None
-
-
+# ----------------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------------
 def main() -> None:
-    if not BOT_TOKEN:
-        raise SystemExit("Missing TELEGRAM_TOKEN or BOT_TOKEN")
-    if not RENDER_URL:
-        raise SystemExit("Missing RENDER_EXTERNAL_URL")
-    if not WEBHOOK_SECRET:
-        raise SystemExit("Missing WEBHOOK_SECRET")
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise SystemExit("BOT_TOKEN env var is missing")
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("testicles", testicles_cmd))
-    app.add_handler(CommandHandler("pengu", pengu_cmd))
-    app.add_handler(CommandHandler("grokius", grokius_cmd))
-    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ca))
-    app.add_error_handler(error_handler)
+    app.add_error_handler(on_error)
 
-    log.info("JABIR RUNNER V2 starting webhook")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=f"{RENDER_URL}/{WEBHOOK_PATH}",
-        secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=True,
-        bootstrap_retries=-1,
-    )
+    log.info("Jabir Runner is live")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
