@@ -1,22 +1,13 @@
+
 services:
   - type: web
-    name: jabir-runner
+    name: jabir-runner-v3
     runtime: python
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    plan: free
-    disk:
-      name: jabir-runner-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
-      - key: DB_PATH
-        value: /var/data/jabir_runner.db
-      - key: PYTHON_VERSION
-        value: 3.11.11
       - key: BOT_TOKEN
-        sync: false
-      - key: RENDER_EXTERNAL_URL
         sync: false
       - key: WEBHOOK_SECRET
         sync: false
@@ -26,3 +17,9 @@ services:
         sync: false
       - key: GROQ_MODEL
         value: openai/gpt-oss-120b
+      - key: DB_PATH
+        value: /var/data/jabir_runner.db
+    disk:
+      name: jabir-runner-data
+      mountPath: /var/data
+      sizeGB: 1
