@@ -1480,6 +1480,7 @@ def report_keyboard(mint: str, pair_url: str, pair_address: Optional[str]) -> In
 
 # ------------------------------ RUNNERS ---------------------------------------
 DEX_TRENDING_URL = "https://api.dexscreener.com/latest/dex/tokens/trending"
+DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q=solana"
 
 def _trending_items(payload: Any) -> list[dict[str, Any]]:
     """Accept the common DexScreener list/dict response shapes."""
@@ -1492,34 +1493,70 @@ def _trending_items(payload: Any) -> list[dict[str, Any]]:
                 return [x for x in value if isinstance(x, dict)]
     return []
 
+def _pick_runners(items: list[dict[str, Any]], min_chg: float, min_liq: float) -> dict[str, dict[str, Any]]:
+    best: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if item.get("chainId") != "solana":
+            continue
+        base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else item
+        mint = str(base.get("address") or item.get("tokenAddress") or "")
+        if not SOL_ADDR_RE.fullmatch(mint) or len(b58decode(mint) or b"") != 32:
+            continue
+        change = safe_num(nested(item, "priceChange", "h24"))
+        liquidity = safe_num(nested(item, "liquidity", "usd"))
+        if change is None or change < min_chg or liquidity is None or liquidity < min_liq:
+            continue
+        previous = best.get(mint)
+        if previous is None:
+            best[mint] = item
+        else:
+            old_change = safe_num(nested(previous, "priceChange", "h24")) or 0
+            old_liq = safe_num(nested(previous, "liquidity", "usd")) or 0
+            if (change, liquidity) > (old_change, old_liq):
+                best[mint] = item
+    return best
+
 async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message:
         return
     status = await message.reply_text("🚀 Finding today's Solana runners...")
     try:
-        payload = await dex_get_json(DEX_TRENDING_URL)
-        items = _trending_items(payload)
         best: dict[str, dict[str, Any]] = {}
-        for item in items:
-            if item.get("chainId") != "solana":
-                continue
-            base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else item
-            mint = str(base.get("address") or item.get("tokenAddress") or "")
-            if not SOL_ADDR_RE.fullmatch(mint) or len(b58decode(mint) or b"") != 32:
-                continue
-            change = safe_num(nested(item, "priceChange", "h24"))
-            liquidity = safe_num(nested(item, "liquidity", "usd"))
-            if change is None or change < 20 or liquidity is None or liquidity < 5000:
-                continue
-            previous = best.get(mint)
-            if previous is None:
-                best[mint] = item
-            else:
-                old_change = safe_num(nested(previous, "priceChange", "h24")) or 0
-                old_liq = safe_num(nested(previous, "liquidity", "usd")) or 0
-                if (change, liquidity) > (old_change, old_liq):
-                    best[mint] = item
+
+        # TRY 1: Search - yafi Trending kawo coins masu tashi
+        try:
+            payload = await dex_get_json(DEX_SEARCH_URL)
+            best = _pick_runners(_trending_items(payload), min_chg=5, min_liq=1000)
+        except Exception:
+            best = {}
+
+        # TRY 2: Idan Search bai samu ba, gwada Trending da filter mai sauki
+        if not best:
+            try:
+                payload = await dex_get_json(DEX_TRENDING_URL)
+                best = _pick_runners(_trending_items(payload), min_chg=5, min_liq=1000)
+            except Exception:
+                pass
+
+        # TRY 3: Idan har yanzu babu, nuna Trending ba tare da filter ba
+        if not best:
+            try:
+                payload = await dex_get_json(DEX_TRENDING_URL)
+                items = _trending_items(payload)
+                for item in items:
+                    if item.get("chainId") != "solana":
+                        continue
+                    base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else item
+                    mint = str(base.get("address") or "")
+                    if not SOL_ADDR_RE.fullmatch(mint):
+                        continue
+                    if mint not in best:
+                        best[mint] = item
+                    if len(best) >= 10:
+                        break
+            except Exception:
+                pass
 
         ranked = sorted(
             best.items(),
@@ -1528,13 +1565,13 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )[:10]
         if not ranked:
             await status.edit_text(
-                "📭 No Solana runners matched the filters right now.\n"
-                "Filters: 24h change ≥ +20% and liquidity ≥ $5K."
+                "😴 Babu runners yanzu. Kasuwa tana kwanciya.\n"
+                "Sake gwadawa daga baya."
             )
             return
 
         lines = ["🚀 <b>JABIR RUNNER | TODAY'S RUNNERS</b>", BAR,
-                 "<i>Solana • 24h gain ≥ 20% • LP ≥ $5K</i>", ""]
+                 "<i>Solana • 24h gain • LP ≥ $1K</i>", ""]
         buttons = []
         for rank, (mint, item) in enumerate(ranked, 1):
             base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else item
@@ -1550,26 +1587,7 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 url = f"https://dexscreener.com/solana/{mint}"
             lines.append(
                 f"<b>#{rank} ${esc(symbol)}</b>  <b>{pct(change)}</b>\n"
-                f"MC {money(mc)} | LP {money(lp)} | Vol 24h {money(vol)}\n"
-                f"<code>{esc(mint)}</code>"
-            )
-            if rank <= 5:
-                buttons.append([InlineKeyboardButton(f"📈 #{rank} ${symbol[:16]} Chart", url=url)])
-        lines += ["", "<i>Trending data is a snapshot, not a safety rating.</i>"]
-        await status.edit_text(
-            "\n".join(lines), parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-            disable_web_page_preview=True,
-        )
-    except DexRateLimited:
-        await status.edit_text("⏳ DexScreener rate limit reached. Try again in 1 minute.")
-    except DexScreenerError as exc:
-        log.warning("/runners DexScreener error: %s", exc)
-        await status.edit_text("❌ DexScreener is unavailable right now. Please try again shortly.")
-    except Exception:
-        log.exception("/runners failed")
-        await status.edit_text("❌ Could not load runners right now. Please try again later.")
-
+                f"MC {money(mc)} | LP {
 
 # ------------------------------ PRICE ALERTS ----------------------------------
 def _valid_mint(value: str) -> bool:
