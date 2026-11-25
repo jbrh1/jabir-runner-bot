@@ -20,7 +20,7 @@ import re
 import sqlite3
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
@@ -109,6 +109,7 @@ _gecko_semaphore: Optional[asyncio.Semaphore] = None
 _dex_last_request: float = -1e9
 _gecko_last_request: float = -1e9
 _MISS = object()
+_alerts_check_lock: Optional[asyncio.Lock] = None
 
 
 class DexScreenerError(RuntimeError):
@@ -259,11 +260,24 @@ def db_connect() -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     return db
 
+@contextmanager
+def db_session():
+    """Commit/rollback and always close the SQLite connection."""
+    db = db_connect()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
 def init_db() -> None:
     folder = os.path.dirname(DB_PATH)
     if folder:
         os.makedirs(folder, exist_ok=True)
-    with db_connect() as db:
+    with db_session() as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS first_seen (
                 mint TEXT PRIMARY KEY, first_seen INTEGER NOT NULL,
@@ -277,10 +291,27 @@ def init_db() -> None:
             )
         """)
         db.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_mint_ts ON snapshots(mint, ts)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(ts)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                mint TEXT NOT NULL,
+                symbol TEXT,
+                target_price REAL,
+                direction TEXT,
+                base_price REAL,
+                pct REAL,
+                created_at INTEGER NOT NULL,
+                triggered INTEGER DEFAULT 0
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user_active ON alerts(user_id, triggered)")
 
 def record_snapshot(mint: str, price: Optional[float], fdv: Optional[float], mc: Optional[float]) -> None:
     now = int(time.time())
-    with db_connect() as db:
+    with db_session() as db:
         db.execute(
             "INSERT OR IGNORE INTO first_seen(mint, first_seen, first_price, first_mc) VALUES(?,?,?,?)",
             (mint, now, price, mc if mc is not None else fdv),
@@ -293,7 +324,7 @@ def record_snapshot(mint: str, price: Optional[float], fdv: Optional[float], mc:
 
 def tracking_data(mint: str) -> dict[str, Any]:
     now = int(time.time())
-    with db_connect() as db:
+    with db_session() as db:
         first = db.execute(
             "SELECT first_seen, first_price, first_mc FROM first_seen WHERE mint=?", (mint,)
         ).fetchone()
@@ -334,9 +365,13 @@ async def request_json(method: str, url: str, **kwargs: Any) -> Any:
             return response.json()
         except httpx.HTTPStatusError as exc:
             body = _scrub(exc.response.text[:300].replace("\n", " "))
-            last_error = f"HTTP {exc.response.status_code}: {body}"
+            status = exc.response.status_code
+            last_error = f"HTTP {status}: {body}"
+            if status < 500 and status != 429:
+                break
             if attempt == 0:
-                await asyncio.sleep(0.5)
+                retry_after = _retry_after_seconds(exc.response) if status == 429 else None
+                await asyncio.sleep(min(retry_after or 0.5, 8.0))
         except (httpx.HTTPError, ValueError) as exc:
             last_error = _scrub(f"{type(exc).__name__}: {exc}")
             if attempt == 0:
@@ -396,11 +431,17 @@ async def dex_get_json(
 
             wait = _dex_backoff(attempt)
             was_rate_limited = False
+            remaining = DEX_TOTAL_DEADLINE - (time.monotonic() - started)
+            if remaining <= 0:
+                problem = f"total request deadline {DEX_TOTAL_DEADLINE:.0f}s reached"
+                break
             try:
-                response = await _http.get(url)
-            except httpx.TransportError as exc:
+                response = await asyncio.wait_for(
+                    _http.get(url), timeout=min(25.0, remaining)
+                )
+            except (httpx.TransportError, asyncio.TimeoutError) as exc:
                 _dex_last_request = time.monotonic()
-                problem = f"network error ({type(exc).__name__})"
+                problem = f"network/timeout error ({type(exc).__name__})"
             else:
                 _dex_last_request = time.monotonic()
                 status = response.status_code
@@ -507,6 +548,8 @@ async def helius_rpc(method: str, params: Any) -> Any:
         params={"api-key": HELIUS_KEY},
         json={"jsonrpc": "2.0", "id": "jabir-runner", "method": method, "params": params},
     )
+    if not isinstance(result, dict):
+        raise RuntimeError("Helius returned an invalid JSON-RPC response")
     if result.get("error"):
         raise RuntimeError(str(result["error"]))
     return result.get("result")
@@ -756,7 +799,7 @@ def summarize_top_holders(
         "excluded_count": len(excluded),
         "excluded_percent": sum(s for _, s in excluded),
         "wallet_share": dict(wallets),
-        "complete": top.get("n_accounts", 20) < 20,
+        "complete": False,  # getTokenLargestAccounts only returns a top-20 sample
         "cutoff_percent": min(all_shares) if all_shares else None,
     }
 
@@ -1211,6 +1254,13 @@ def verdict(data: dict[str, Any]) -> tuple[str, str]:
     high = [text for level, text in flags if level == "HIGH"]
     if high:
         return "🟡 WATCH", "High risk: " + high[0]
+    medium = [text for level, text in flags if level == "MEDIUM"]
+    if medium:
+        return "🟡 WATCH", "Risk flag: " + medium[0]
+    authorities = data.get("authorities") or {}
+    if (authorities.get("mint_authority_active") is not False
+            or authorities.get("freeze_authority_active") is not False):
+        return "🟡 WATCH", "Mint/freeze authority status is not confirmed revoked"
     if age is not None and age < 3600 and vol is not None and mc and vol > mc * 2:
         return "🟡 WATCH", "Very new token with unusually high volume"
     if chg is not None and chg > 100 and liq is not None and vol is not None and vol > liq:
@@ -1427,13 +1477,371 @@ def report_keyboard(mint: str, pair_url: str, pair_address: Optional[str]) -> In
         ],
     ])
 
+
+# ------------------------------ RUNNERS ---------------------------------------
+DEX_TRENDING_URL = "https://api.dexscreener.com/latest/dex/tokens/trending"
+
+def _trending_items(payload: Any) -> list[dict[str, Any]]:
+    """Accept the common DexScreener list/dict response shapes."""
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for key in ("pairs", "tokens", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+    return []
+
+async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message:
+        return
+    status = await message.reply_text("🚀 Finding today's Solana runners...")
+    try:
+        payload = await dex_get_json(DEX_TRENDING_URL)
+        items = _trending_items(payload)
+        best: dict[str, dict[str, Any]] = {}
+        for item in items:
+            if item.get("chainId") != "solana":
+                continue
+            base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else item
+            mint = str(base.get("address") or item.get("tokenAddress") or "")
+            if not SOL_ADDR_RE.fullmatch(mint) or len(b58decode(mint) or b"") != 32:
+                continue
+            change = safe_num(nested(item, "priceChange", "h24"))
+            liquidity = safe_num(nested(item, "liquidity", "usd"))
+            if change is None or change < 20 or liquidity is None or liquidity < 5000:
+                continue
+            previous = best.get(mint)
+            if previous is None:
+                best[mint] = item
+            else:
+                old_change = safe_num(nested(previous, "priceChange", "h24")) or 0
+                old_liq = safe_num(nested(previous, "liquidity", "usd")) or 0
+                if (change, liquidity) > (old_change, old_liq):
+                    best[mint] = item
+
+        ranked = sorted(
+            best.items(),
+            key=lambda kv: safe_num(nested(kv[1], "priceChange", "h24")) or 0,
+            reverse=True,
+        )[:10]
+        if not ranked:
+            await status.edit_text(
+                "📭 No Solana runners matched the filters right now.\n"
+                "Filters: 24h change ≥ +20% and liquidity ≥ $5K."
+            )
+            return
+
+        lines = ["🚀 <b>JABIR RUNNER | TODAY'S RUNNERS</b>", BAR,
+                 "<i>Solana • 24h gain ≥ 20% • LP ≥ $5K</i>", ""]
+        buttons = []
+        for rank, (mint, item) in enumerate(ranked, 1):
+            base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else item
+            symbol = str(base.get("symbol") or item.get("symbol") or "?")
+            change = safe_num(nested(item, "priceChange", "h24"))
+            mc = safe_num(item.get("marketCap"))
+            if mc is None:
+                mc = safe_num(item.get("fdv"))
+            lp = safe_num(nested(item, "liquidity", "usd"))
+            vol = safe_num(nested(item, "volume", "h24"))
+            url = item.get("url")
+            if not isinstance(url, str) or not url.startswith("https://dexscreener.com/"):
+                url = f"https://dexscreener.com/solana/{mint}"
+            lines.append(
+                f"<b>#{rank} ${esc(symbol)}</b>  <b>{pct(change)}</b>\n"
+                f"MC {money(mc)} | LP {money(lp)} | Vol 24h {money(vol)}\n"
+                f"<code>{esc(mint)}</code>"
+            )
+            if rank <= 5:
+                buttons.append([InlineKeyboardButton(f"📈 #{rank} ${symbol[:16]} Chart", url=url)])
+        lines += ["", "<i>Trending data is a snapshot, not a safety rating.</i>"]
+        await status.edit_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+            disable_web_page_preview=True,
+        )
+    except DexRateLimited:
+        await status.edit_text("⏳ DexScreener rate limit reached. Try again in 1 minute.")
+    except DexScreenerError as exc:
+        log.warning("/runners DexScreener error: %s", exc)
+        await status.edit_text("❌ DexScreener is unavailable right now. Please try again shortly.")
+    except Exception:
+        log.exception("/runners failed")
+        await status.edit_text("❌ Could not load runners right now. Please try again later.")
+
+
+# ------------------------------ PRICE ALERTS ----------------------------------
+def _valid_mint(value: str) -> bool:
+    return bool(SOL_ADDR_RE.fullmatch(value)) and len(b58decode(value) or b"") == 32
+
+def _alert_usage() -> str:
+    return (
+        "Usage:\n"
+        "/alert <CA> <price> <above|below>\n"
+        "Example: /alert 3pGm... 0.001 above\n\n"
+        "/alert <CA> <+/-percent>%\n"
+        "Example: /alert 3pGm... +50%"
+    )
+
+def _create_alert(
+    user_id: int, chat_id: int, mint: str, symbol: str,
+    target_price: float, direction: str, base_price: float,
+    percent: Optional[float],
+) -> int:
+    with db_session() as db:
+        db.execute("BEGIN IMMEDIATE")
+        active = db.execute(
+            "SELECT COUNT(*) FROM alerts WHERE user_id=? AND triggered=0",
+            (user_id,),
+        ).fetchone()[0]
+        if active >= 10:
+            return None
+        cursor = db.execute(
+            """INSERT INTO alerts
+               (user_id, chat_id, mint, symbol, target_price, direction,
+                base_price, pct, created_at, triggered)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            (user_id, chat_id, mint, symbol, target_price, direction,
+             base_price, percent, int(time.time())),
+        )
+        return int(cursor.lastrowid)
+
+def _active_alert_count(user_id: int) -> int:
+    with db_session() as db:
+        row = db.execute(
+            "SELECT COUNT(*) FROM alerts WHERE user_id=? AND triggered=0",
+            (user_id,),
+        ).fetchone()
+    return int(row[0] or 0)
+
+def _get_user_alerts(user_id: int, limit: int = 20) -> list[tuple]:
+    with db_session() as db:
+        return db.execute(
+            """SELECT id, mint, symbol, target_price, direction, base_price,
+                      pct, created_at, triggered
+               FROM alerts WHERE user_id=? ORDER BY id DESC LIMIT ?""",
+            (user_id, limit),
+        ).fetchall()
+
+def _delete_alert(user_id: int, alert_id: int) -> int:
+    with db_session() as db:
+        cursor = db.execute(
+            "DELETE FROM alerts WHERE user_id=? AND id=?",
+            (user_id, alert_id),
+        )
+        return cursor.rowcount
+
+def _clear_alerts(user_id: int) -> int:
+    with db_session() as db:
+        cursor = db.execute("DELETE FROM alerts WHERE user_id=?", (user_id,))
+        return cursor.rowcount
+
+def _untriggered_alerts() -> list[tuple]:
+    with db_session() as db:
+        return db.execute(
+            """SELECT id, user_id, chat_id, mint, symbol, target_price,
+                      direction, base_price, pct
+               FROM alerts WHERE triggered=0 ORDER BY id ASC"""
+        ).fetchall()
+
+def _mark_alert_triggered(alert_id: int) -> bool:
+    with db_session() as db:
+        cursor = db.execute(
+            "UPDATE alerts SET triggered=1 WHERE id=? AND triggered=0",
+            (alert_id,),
+        )
+        return cursor.rowcount == 1
+
+async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    args = context.args or []
+    if len(args) not in (2, 3):
+        await message.reply_text(_alert_usage())
+        return
+
+    mint = args[0].strip()
+    if not _valid_mint(mint):
+        await message.reply_text("❌ Invalid Solana CA")
+        return
+
+    if len(args) == 3:
+        price = safe_num(args[1])
+        direction = args[2].lower()
+        if price is None or price <= 0 or direction not in ("above", "below"):
+            await message.reply_text(_alert_usage())
+            return
+        percent = None
+    else:
+        raw_percent = args[1].strip()
+        if not raw_percent.endswith("%"):
+            await message.reply_text(_alert_usage())
+            return
+        percent_value = safe_num(raw_percent[:-1])
+        if percent_value is None or percent_value == 0 or abs(percent_value) > 100000:
+            await message.reply_text(_alert_usage())
+            return
+        direction = "up_pct" if percent_value > 0 else "down_pct"
+        percent = abs(percent_value)
+        price = None
+
+    try:
+        if await asyncio.to_thread(_active_alert_count, user.id) >= 10:
+            await message.reply_text("You have max 10 active alerts")
+            return
+        pair = await fetch_pair(mint)
+        if not pair:
+            await message.reply_text("❌ Token not found on DexScreener.")
+            return
+        current = safe_num(pair.get("priceUsd"))
+        if current is None or current <= 0:
+            await message.reply_text("❌ Current token price is unavailable. Try again later.")
+            return
+        symbol = str(nested(pair, "baseToken", "symbol") or "?")
+        if direction == "above":
+            target = price
+        elif direction == "below":
+            target = price
+        elif direction == "up_pct":
+            target = current * (1 + (percent or 0) / 100)
+        else:
+            target = current * (1 - (percent or 0) / 100)
+            if target <= 0:
+                await message.reply_text("❌ Percentage is too large for a downward price alert.")
+                return
+
+        alert_id = await asyncio.to_thread(
+            _create_alert, user.id, message.chat_id, mint, symbol,
+            target, direction, current, percent,
+        )
+        if alert_id is None:
+            await message.reply_text("You have max 10 active alerts")
+            return
+        await message.reply_text(
+            f"✅ <b>Price alert created</b>\n"
+            f"ID: <code>{alert_id}</code> | ${esc(symbol)}\n"
+            f"Current: <code>{current:.12g}</code>\n"
+            f"Target: <code>{target:.12g}</code> ({esc(direction)})\n"
+            f"Use /alerts to manage your alerts.",
+            parse_mode=ParseMode.HTML,
+        )
+    except DexRateLimited:
+        await message.reply_text("⏳ DexScreener rate limit reached. Try again in 1 minute.")
+    except Exception:
+        log.exception("Could not create price alert")
+        await message.reply_text("❌ Could not create alert right now. Please try again.")
+
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message, user = update.effective_message, update.effective_user
+    if not message or not user:
+        return
+    try:
+        rows = await asyncio.to_thread(_get_user_alerts, user.id)
+        if not rows:
+            await message.reply_text("You have no alerts yet. Create one with /alert.")
+            return
+        lines = ["🔔 <b>YOUR PRICE ALERTS</b>", BAR]
+        for row in rows:
+            alert_id, mint, symbol, target, direction, base, percent, created, triggered = row
+            status = "✅ TRIGGERED" if triggered else "🟢 ACTIVE"
+            lines.append(
+                f"<b>#{alert_id} ${esc(symbol or '?')}</b> · {status}\n"
+                f"Target: <code>{format(safe_num(target), '.12g') if safe_num(target) is not None else 'N/A'}</code> · {esc(direction)}\n"
+                f"<code>{esc(mint)}</code>"
+            )
+        lines.append("\nUse /delalert ID to delete one, /clearalerts to delete all.")
+        await message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception:
+        log.exception("Could not list alerts")
+        await message.reply_text("❌ Could not load your alerts.")
+
+async def delalert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message, user = update.effective_message, update.effective_user
+    if not message or not user:
+        return
+    if len(context.args or []) != 1 or not (context.args[0].isdigit()):
+        await message.reply_text("Usage: /delalert <id>")
+        return
+    try:
+        count = await asyncio.to_thread(_delete_alert, user.id, int(context.args[0]))
+        await message.reply_text("✅ Alert deleted." if count else "Alert not found.")
+    except Exception:
+        log.exception("Could not delete alert")
+        await message.reply_text("❌ Could not delete alert.")
+
+async def clearalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message, user = update.effective_message, update.effective_user
+    if not message or not user:
+        return
+    try:
+        count = await asyncio.to_thread(_clear_alerts, user.id)
+        await message.reply_text(f"✅ Deleted {count} alert(s).")
+    except Exception:
+        log.exception("Could not clear alerts")
+        await message.reply_text("❌ Could not clear alerts.")
+
+async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background alert monitor. One pass at a time; each token uses fetch_pair cache."""
+    global _alerts_check_lock
+    if _alerts_check_lock is None:
+        _alerts_check_lock = asyncio.Lock()
+    if _alerts_check_lock.locked():
+        return
+    async with _alerts_check_lock:
+        try:
+            rows = await asyncio.to_thread(_untriggered_alerts)
+        except Exception:
+            log.exception("Could not read active alerts")
+            return
+
+        for row in rows:
+            alert_id, user_id, chat_id, mint, symbol, target, direction, base, percent = row
+            try:
+                pair = await fetch_pair(mint)
+                if not pair:
+                    continue
+                current = safe_num(pair.get("priceUsd"))
+                target = safe_num(target)
+                if current is None or target is None or current <= 0:
+                    continue
+                hit = (
+                    (direction in ("above", "up_pct") and current >= target)
+                    or (direction in ("below", "down_pct") and current <= target)
+                )
+                if not hit:
+                    continue
+                # Mark first, so a Telegram/network error cannot cause repeated spam.
+                marked = await asyncio.to_thread(_mark_alert_triggered, alert_id)
+                if not marked:
+                    continue
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🔔 <b>ALERT TRIGGERED</b> ${esc(symbol or nested(pair, 'baseToken', 'symbol') or '?')} "
+                        f"reached <code>{current:.12g}</code> "
+                        f"(target <code>{target:.12g}</code>)"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                await perform_scan(mint, context, chat_id=chat_id, deep=False, announce=False)
+            except Exception:
+                log.exception("Alert check failed for alert ID %s", alert_id)
+                continue
+
+
 # ------------------------------ TELEGRAM -------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
             "🚀 <b>JABIR RUNNER V3</b>\n<i>See Beyond The Chart.</i>\n\n"
             "Send a Solana token address (CA) to scan it.\n"
-            "Quick tests: /testicles /pengu /grokius\nCommands: /help",
+            "Quick tests: /testicles /pengu /grokius\n"
+            "Today's runners: /runners\n"
+            "Price alerts: /alert | /alerts | /delalert | /clearalerts\n"
+            "Commands: /help",
             parse_mode=ParseMode.HTML,
         )
 
@@ -1443,6 +1851,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "📖 <b>JABIR RUNNER V3 GUIDE</b>\n\n"
             "• Send a Solana CA to scan it.\n"
             "• /testicles, /pengu, /grokius are quick tests.\n"
+            "• /runners lists today's top Solana runners (24h +20%, LP $5K+).\n"
+            "• <code>/alert CA 0.001 above</code> or <code>/alert CA +50%</code> creates a price alert.\n"
+            "• <code>/alerts</code> lists alerts; <code>/delalert ID</code> deletes one; <code>/clearalerts</code> deletes all.\n"
             "• Refresh updates the market data.\n"
             "• Deep Scan adds total holder count and an ESTIMATE of launch bundles, snipers and dev wallet "
             "(only works for tokens with a small transaction history).\n\n"
@@ -1529,6 +1940,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not query:
         return
     await query.answer()
+    if query.message is None:
+        return
     raw = query.data or ""
     if ":" not in raw:
         return
@@ -1573,6 +1986,15 @@ def main() -> None:
     app.add_handler(CommandHandler("testicles", testicles_cmd))
     app.add_handler(CommandHandler("pengu", pengu_cmd))
     app.add_handler(CommandHandler("grokius", grokius_cmd))
+    app.add_handler(CommandHandler("runners", runners_command))
+    app.add_handler(CommandHandler("alert", alert_command))
+    app.add_handler(CommandHandler("alerts", alerts_command))
+    app.add_handler(CommandHandler("delalert", delalert_command))
+    app.add_handler(CommandHandler("clearalerts", clearalerts_command))
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(check_alerts, interval=120, first=10, name="price-alert-checker")
+    else:
+        log.error("JobQueue is unavailable. Install python-telegram-bot[job-queue] to enable price alerts.")
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ca))
     app.add_error_handler(error_handler)
