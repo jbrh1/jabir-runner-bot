@@ -47,6 +47,9 @@ WEBHOOK_PATH = "telegram-webhook"
 
 DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 DEX_ORDERS_URL = "https://api.dexscreener.com/orders/v1/solana/{}"
+DEX_BOOSTS_LATEST_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
+DEX_BOOSTS_TOP_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 GECKO_OHLCV_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/{timeframe}"
 HELIUS_RPC_URL = "https://mainnet.helius-rpc.com/"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -112,7 +115,7 @@ _alerts_check_lock: Optional[asyncio.Lock] = None
 
 
 class DexScreenerError(RuntimeError):
-    """DexScreener request failed (permanent 4xx, repeated 5xx/network errors, bad data)."""
+    """DexScreener request failed."""
 
 
 class DexRateLimited(DexScreenerError):
@@ -1421,129 +1424,168 @@ def report_keyboard(mint: str, pair_url: str, pair_address: Optional[str]) -> In
     ])
 
 
-# ------------------------------ RUNNERS ---------------------------------------
-DEX_TRENDING_URL = "https://api.dexscreener.com/latest/dex/tokens/trending"
-DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q=solana"
-
-def _trending_items(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-    if isinstance(payload, dict):
-        for key in ("pairs", "tokens", "data"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [x for x in value if isinstance(x, dict)]
-    return []
-
-def _pick_runners(items: list[dict[str, Any]], min_chg: float, min_liq: float) -> dict[str, dict[str, Any]]:
-    best: dict[str, dict[str, Any]] = {}
-    for item in items:
-        if item.get("chainId") != "solana":
-            continue
-        base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else item
-        mint = str(base.get("address") or item.get("tokenAddress") or "")
-        if not SOL_ADDR_RE.fullmatch(mint) or len(b58decode(mint) or b"") != 32:
-            continue
-        change = safe_num(nested(item, "priceChange", "h24"))
-        liquidity = safe_num(nested(item, "liquidity", "usd"))
-        if change is None or change < min_chg or liquidity is None or liquidity < min_liq:
-            continue
-        previous = best.get(mint)
-        if previous is None:
-            best[mint] = item
-        else:
-            old_change = safe_num(nested(previous, "priceChange", "h24")) or 0
-            old_liq = safe_num(nested(previous, "liquidity", "usd")) or 0
-            if (change, liquidity) > (old_change, old_liq):
-                best[mint] = item
-    return best
-
+# ------------------------------ RUNNERS (Boosted + Trending + New Pairs) ---------------------------------------
 async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message:
         return
-    status = await message.reply_text("🚀 Finding today's Solana runners...")
+    status = await message.reply_text("🚀 Finding top Solana runners...")
     try:
-        best: dict[str, dict[str, Any]] = {}
+        candidates: dict[str, dict[str, Any]] = {}
 
-        try:
-            payload = await dex_get_json(DEX_SEARCH_URL)
-            best = _pick_runners(_trending_items(payload), min_chg=5, min_liq=1000)
-        except Exception:
-            best = {}
-
-        if not best:
+        # Fetch from multiple sources in parallel
+        async def fetch_boosts() -> list:
             try:
-                payload = await dex_get_json(DEX_TRENDING_URL)
-                best = _pick_runners(_trending_items(payload), min_chg=5, min_liq=1000)
+                latest = await dex_get_json(DEX_BOOSTS_LATEST_URL)
+                top = await dex_get_json(DEX_BOOSTS_TOP_URL)
+                items = []
+                for payload in (latest, top):
+                    if isinstance(payload, list):
+                        items.extend(payload)
+                return items
             except Exception:
-                pass
+                return []
 
-        if not best:
+        async def fetch_trending() -> list:
             try:
-                payload = await dex_get_json(DEX_TRENDING_URL)
-                items = _trending_items(payload)
-                for item in items:
-                    if item.get("chainId") != "solana":
-                        continue
-                    base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else item
-                    mint = str(base.get("address") or "")
-                    if not SOL_ADDR_RE.fullmatch(mint):
-                        continue
-                    if mint not in best:
-                        best[mint] = item
-                    if len(best) >= 10:
-                        break
+                # Search for trending Solana tokens
+                payload = await dex_get_json(f"{DEX_SEARCH_URL}?q=solana")
+                if isinstance(payload, dict) and isinstance(payload.get("pairs"), list):
+                    return payload["pairs"]
+                return []
             except Exception:
-                pass
+                return []
 
-        ranked = sorted(
-            best.items(),
-            key=lambda kv: safe_num(nested(kv[1], "priceChange", "h24")) or 0,
-            reverse=True,
-        )[:10]
+        boosts_items, trending_items = await asyncio.gather(
+            fetch_boosts(), fetch_trending(), return_exceptions=True
+        )
+
+        # Process boosted tokens (they have chainId and tokenAddress)
+        if isinstance(boosts_items, list):
+            for item in boosts_items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("chainId") != "solana":
+                    continue
+                token_addr = item.get("tokenAddress")
+                if not token_addr or not SOL_ADDR_RE.fullmatch(token_addr):
+                    continue
+                # Boosts don't have pair data; we'll fetch it later via search or tokens endpoint
+                # Store minimal info for now
+                candidates.setdefault(token_addr, {"_needs_pair": True, "_boost_item": item})
+
+        # Process trending/search pairs directly
+        if isinstance(trending_items, list):
+            for item in trending_items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("chainId") != "solana":
+                    continue
+                base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else {}
+                token_addr = base.get("address")
+                if not token_addr or not SOL_ADDR_RE.fullmatch(token_addr):
+                    continue
+                # If we already have this mint from boosts, merge
+                existing = candidates.get(token_addr)
+                if existing and existing.get("_needs_pair"):
+                    existing["_pair_data"] = item
+                elif not existing:
+                    candidates[token_addr] = {"_pair_data": item}
+
+        # For boosted tokens without pair data, fetch pair info
+        tokens_to_fetch = [
+            mint for mint, data in candidates.items()
+            if data.get("_needs_pair") and not data.get("_pair_data")
+        ]
+        if tokens_to_fetch:
+            # Fetch in batches to avoid too many requests
+            for mint in tokens_to_fetch[:15]:  # limit to avoid rate limits
+                try:
+                    pair = await fetch_pair(mint)
+                    if pair:
+                        candidates[mint]["_pair_data"] = pair
+                except Exception:
+                    pass
+
+        # Now filter and score
+        results: list[dict[str, Any]] = []
+        seen_mints: set[str] = set()
+
+        for mint, data in candidates.items():
+            if mint in seen_mints:
+                continue
+            pair = data.get("_pair_data")
+            if not pair or not isinstance(pair, dict):
+                continue
+
+            # Extract fields
+            base = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+            symbol = str(base.get("symbol") or "?")
+            mc = safe_num(pair.get("marketCap")) or safe_num(pair.get("fdv"))
+            liq = safe_num(nested(pair, "liquidity", "usd"))
+            vol = safe_num(nested(pair, "volume", "h24"))
+            change = safe_num(nested(pair, "priceChange", "h24"))
+            url = pair.get("url")
+
+            # Apply filters: MC > $100K, LP > $5K, Vol 24h > $10K, 24h change > +5%
+            if mc is None or mc <= 100_000:
+                continue
+            if liq is None or liq <= 5_000:
+                continue
+            if vol is None or vol <= 10_000:
+                continue
+            if change is None or change <= 5:
+                continue
+
+            if not isinstance(url, str) or not url.startswith("https://dexscreener.com/"):
+                url = f"https://dexscreener.com/solana/{mint}"
+
+            results.append({
+                "mint": mint,
+                "symbol": symbol,
+                "change": change,
+                "mc": mc,
+                "liq": liq,
+                "vol": vol,
+                "url": url,
+            })
+            seen_mints.add(mint)
+
+        # Sort by volume (descending) and take top 10
+        results.sort(key=lambda x: x["vol"], reverse=True)
+        ranked = results[:10]
+
         if not ranked:
             await status.edit_text(
-                "😴 Babu runners yanzu. Kasuwa tana kwanciya.\n"
-                "Sake gwadawa daga baya."
+                "No runners found right now. Market is slow. Try again later."
             )
             return
 
-        lines = ["🚀 <b>JABIR RUNNER | TODAY'S RUNNERS</b>", BAR,
-                 "<i>Solana • 24h gain • LP ≥ $1K</i>", ""]
+        lines = ["🚀 <b>JABIR RUNNER | TOP RUNNERS</b>", BAR,
+                 "<i>Solana • 24h gain • MC > $100K • LP > $5K • Vol > $10K</i>", ""]
         buttons = []
-        for rank, (mint, item) in enumerate(ranked, 1):
-            base = item.get("baseToken") if isinstance(item.get("baseToken"), dict) else item
-            symbol = str(base.get("symbol") or item.get("symbol") or "?")
-            change = safe_num(nested(item, "priceChange", "h24"))
-            mc = safe_num(item.get("marketCap"))
-            if mc is None:
-                mc = safe_num(item.get("fdv"))
-            lp = safe_num(nested(item, "liquidity", "usd"))
-            vol = safe_num(nested(item, "volume", "h24"))
-            url = item.get("url")
-            if not isinstance(url, str) or not url.startswith("https://dexscreener.com/"):
-                url = f"https://dexscreener.com/solana/{mint}"
+        for rank, r in enumerate(ranked, 1):
             lines.append(
-                f"<b>#{rank} ${esc(symbol)}</b>  <b>{pct(change)}</b>\n"
-                f"MC {money(mc)} | LP {money(lp)} | Vol {money(vol)}"
+                f"<b>#{rank} ${esc(r['symbol'])}</b>  <b>{pct(r['change'])}</b>\n"
+                f"MC {money(r['mc'])} | LP {money(r['liq'])} | Vol {money(r['vol'])}\n"
+                f"<code>{esc(r['mint'])}</code>"
             )
             if rank <= 5:
-                buttons.append([InlineKeyboardButton(f"📈 #{rank} ${symbol[:16]} Chart", url=url)])
-        lines += ["", "<i>Trending data is a snapshot, not a safety rating.</i>"]
+                buttons.append([InlineKeyboardButton(f"📈 #{rank} ${r['symbol'][:16]} Chart", url=r["url"])])
+        lines += ["", "<i>Data from DexScreener. Not financial advice.</i>"]
         await status.edit_text(
-            "\n".join(lines), parse_mode=ParseMode.HTML,
+            "\n\n".join(lines), parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
             disable_web_page_preview=True,
         )
     except DexRateLimited:
-        await status.edit_text("⏳ DexScreener rate limit reached. Try again in 1 minute.")
+        await status.edit_text("Rate limit reached. Try again in 1 minute.")
     except DexScreenerError as exc:
         log.warning("/runners DexScreener error: %s", exc)
-        await status.edit_text("❌ DexScreener is unavailable right now. Please try again shortly.")
+        await status.edit_text("DexScreener is unavailable right now. Please try again shortly.")
     except Exception:
         log.exception("/runners failed")
-        await status.edit_text("❌ Could not load runners right now. Please try again later.")
+        await status.edit_text("Could not load runners right now. Please try again later.")
 
 # ------------------------------ PRICE ALERTS ----------------------------------
 def _valid_mint(value: str) -> bool:
@@ -1639,7 +1681,7 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     mint = args[0].strip()
     if not _valid_mint(mint):
-        await message.reply_text("❌ Invalid Solana CA")
+        await message.reply_text("Invalid Solana token address.")
         return
 
     if len(args) == 3:
@@ -1664,15 +1706,15 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         if await asyncio.to_thread(_active_alert_count, user.id) >= 10:
-            await message.reply_text("You have max 10 active alerts")
+            await message.reply_text("You have max 10 active alerts.")
             return
         pair = await fetch_pair(mint)
         if not pair:
-            await message.reply_text("❌ Token not found on DexScreener.")
+            await message.reply_text("Token not found on DexScreener.")
             return
         current = safe_num(pair.get("priceUsd"))
         if current is None or current <= 0:
-            await message.reply_text("❌ Current token price is unavailable. Try again later.")
+            await message.reply_text("Current token price is unavailable. Try again later.")
             return
         symbol = str(nested(pair, "baseToken", "symbol") or "?")
         if direction == "above":
@@ -1684,7 +1726,7 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             target = current * (1 - (percent or 0) / 100)
             if target <= 0:
-                await message.reply_text("❌ Percentage is too large for a downward price alert.")
+                await message.reply_text("Percentage is too large for a downward price alert.")
                 return
 
         alert_id = await asyncio.to_thread(
@@ -1692,10 +1734,10 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             target, direction, current, percent,
         )
         if alert_id is None:
-            await message.reply_text("You have max 10 active alerts")
+            await message.reply_text("You have max 10 active alerts.")
             return
         await message.reply_text(
-            f"✅ <b>Price alert created</b>\n"
+            f"✅ <b>Alert Created</b>\n"
             f"ID: <code>{alert_id}</code> | ${esc(symbol)}\n"
             f"Current: <code>{current:.12g}</code>\n"
             f"Target: <code>{target:.12g}</code> ({esc(direction)})\n"
@@ -1703,10 +1745,10 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             parse_mode=ParseMode.HTML,
         )
     except DexRateLimited:
-        await message.reply_text("⏳ DexScreener rate limit reached. Try again in 1 minute.")
+        await message.reply_text("Rate limit reached. Try again in 1 minute.")
     except Exception:
         log.exception("Could not create price alert")
-        await message.reply_text("❌ Could not create alert right now. Please try again.")
+        await message.reply_text("Could not create alert right now. Please try again.")
 
 async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.effective_message, update.effective_user
@@ -1732,7 +1774,7 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("Could not list alerts")
-        await message.reply_text("❌ Could not load your alerts.")
+        await message.reply_text("Could not load your alerts.")
 
 async def delalert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.effective_message, update.effective_user
@@ -1743,10 +1785,10 @@ async def delalert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     try:
         count = await asyncio.to_thread(_delete_alert, user.id, int(context.args[0]))
-        await message.reply_text("✅ Alert deleted." if count else "Alert not found.")
+        await message.reply_text("Alert deleted." if count else "Alert not found.")
     except Exception:
         log.exception("Could not delete alert")
-        await message.reply_text("❌ Could not delete alert.")
+        await message.reply_text("Could not delete alert.")
 
 async def clearalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.effective_message, update.effective_user
@@ -1754,10 +1796,10 @@ async def clearalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     try:
         count = await asyncio.to_thread(_clear_alerts, user.id)
-        await message.reply_text(f"✅ Deleted {count} alert(s).")
+        await message.reply_text(f"Deleted {count} alert(s).")
     except Exception:
         log.exception("Could not clear alerts")
-        await message.reply_text("❌ Could not clear alerts.")
+        await message.reply_text("Could not clear alerts.")
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     global _alerts_check_lock
@@ -1794,7 +1836,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🔔 <b>ALERT TRIGGERED</b> ${esc(symbol or nested(pair, 'baseToken', 'symbol') or '?')} "
+                        f"🔔 <b>Alert Triggered</b> ${esc(symbol or nested(pair, 'baseToken', 'symbol') or '?')} "
                         f"reached <code>{current:.12g}</code> "
                         f"(target <code>{target:.12g}</code>)"
                     ),
@@ -1813,7 +1855,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "🚀 <b>JABIR RUNNER V3</b>\n<i>See Beyond The Chart.</i>\n\n"
             "Send a Solana token address (CA) to scan it.\n"
             "Quick tests: /testicles /pengu /grokius\n"
-            "Today's runners: /runners\n"
+            "Top runners: /runners\n"
             "Price alerts: /alert | /alerts | /delalert | /clearalerts\n"
             "Commands: /help",
             parse_mode=ParseMode.HTML,
@@ -1825,11 +1867,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "📖 <b>JABIR RUNNER V3 GUIDE</b>\n\n"
             "• Send a Solana CA to scan it.\n"
             "• /testicles, /pengu, /grokius are quick tests.\n"
-            "• /runners lists today's top Solana runners (24h +5%, LP $1K+).\n"
+            "• /runners lists top Solana runners (MC > $100K, LP > $5K, Vol > $10K, 24h +5%).\n"
             "• <code>/alert CA 0.001 above</code> or <code>/alert CA +50%</code> creates a price alert.\n"
             "• <code>/alerts</code> lists alerts; <code>/delalert ID</code> deletes one; <code>/clearalerts</code> deletes all.\n"
             "• Refresh updates the market data.\n"
-            "• Deep Scan adds total holder count and an ESTIMATE of launch bundles, snipers and dev wallet "
+            "• Deep Scan adds total holder count and an estimate of launch bundles, snipers and dev wallet "
             "(only works for tokens with a small transaction history).\n\n"
             "Top holders exclude pool/program wallets. ATH comes from GeckoTerminal chart data. "
             "Bundle/sniper/dev numbers are estimates, not proof.",
@@ -1852,7 +1894,7 @@ async def perform_scan(
 
     try:
         if status_message and announce:
-            await status_message.edit_text("🔍 Scanning..." + (" (deep scan)" if deep else ""))
+            await status_message.edit_text("Scanning..." + (" (deep scan)" if deep else ""))
         data = await collect_token_data(mint, deep=deep)
         narrative = await groq_narrative(data)
         report = build_report(data, narrative, deep)
@@ -1868,16 +1910,16 @@ async def perform_scan(
                 disable_web_page_preview=True,
             )
     except ValueError as exc:
-        await notify(f"❌ {exc}")
+        await notify(f"{exc}")
     except DexRateLimited as exc:
         log.warning("Scan for %s stopped by DexScreener rate limit: %s", mint, exc)
-        await notify("⏳ DexScreener is rate-limiting requests right now. Please try again in about a minute.")
+        await notify("DexScreener is rate-limiting requests right now. Please try again in about a minute.")
     except DexScreenerError as exc:
         log.warning("Scan for %s failed, DexScreener error: %s", mint, exc)
-        await notify("❌ DexScreener is not responding properly right now. Please try again shortly.")
+        await notify("DexScreener is not responding properly right now. Please try again shortly.")
     except Exception:
         log.exception("Scan failed for %s", mint)
-        await notify("❌ Scan failed. Check the Render logs and API keys.")
+        await notify("Scan failed. Check the Render logs and API keys.")
 
 async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -1891,12 +1933,12 @@ async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
     except Exception:
         pass
-    status = await message.reply_text("🔍 Scanning...")
+    status = await message.reply_text("Scanning...")
     await perform_scan(mint, context, status_message=status, deep=False, announce=False)
 
 async def preset_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
     if update.message:
-        status = await update.message.reply_text(f"🔍 Scanning {key.upper()}...")
+        status = await update.message.reply_text(f"Scanning {key.upper()}...")
         await perform_scan(TEST_TOKENS[key], context, status_message=status, deep=False, announce=False)
 
 async def testicles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
