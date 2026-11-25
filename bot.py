@@ -3,7 +3,7 @@ JABIR RUNNER V3 - TRADER EDITION
 Solana token scanner | Python 3.11 | python-telegram-bot 21+
 DexScreener + GeckoTerminal + Helius + Groq | Render Webhook
 
-Optional env vars: CACHE_TTL (default 60), PAID_CACHE_TTL (default 300), GROQ_MODEL
+Optional env vars: CACHE_TTL, PAID_CACHE_TTL, GROQ_MODEL, ADMIN_USER_ID
 """
 from __future__ import annotations
 
@@ -45,6 +45,9 @@ PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 WEBHOOK_PATH = "telegram-webhook"
 
+# Admin user ID — only this user can run /stats
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+
 DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 DEX_ORDERS_URL = "https://api.dexscreener.com/orders/v1/solana/{}"
 DEX_BOOSTS_LATEST_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
@@ -64,13 +67,14 @@ ATH_CACHE_TTL = 300
 ATH_FAIL_TTL = 60
 NARRATIVE_CACHE_TTL = 300
 
-ATH_TIMEOUT = float(os.getenv("ATH_TIMEOUT", "3.0"))
-NARRATIVE_TIMEOUT = float(os.getenv("NARRATIVE_TIMEOUT", "3.5"))
-AUTHORITY_TIMEOUT = float(os.getenv("AUTHORITY_TIMEOUT", "3.0"))
-PAID_TIMEOUT = float(os.getenv("PAID_TIMEOUT", "3.0"))
-TOP_HOLDERS_TIMEOUT = float(os.getenv("TOP_HOLDERS_TIMEOUT", "6.0"))
-FULL_HOLDERS_TIMEOUT = float(os.getenv("FULL_HOLDERS_TIMEOUT", "12.0"))
-LAUNCH_TIMEOUT = float(os.getenv("LAUNCH_TIMEOUT", "20.0"))
+# Fast timeouts (scan should finish in ~5-8s)
+ATH_TIMEOUT = float(os.getenv("ATH_TIMEOUT", "2.5"))
+NARRATIVE_TIMEOUT = float(os.getenv("NARRATIVE_TIMEOUT", "2.5"))
+AUTHORITY_TIMEOUT = float(os.getenv("AUTHORITY_TIMEOUT", "2.0"))
+PAID_TIMEOUT = float(os.getenv("PAID_TIMEOUT", "2.0"))
+TOP_HOLDERS_TIMEOUT = float(os.getenv("TOP_HOLDERS_TIMEOUT", "4.0"))
+FULL_HOLDERS_TIMEOUT = float(os.getenv("FULL_HOLDERS_TIMEOUT", "10.0"))
+LAUNCH_TIMEOUT = float(os.getenv("LAUNCH_TIMEOUT", "15.0"))
 
 CACHE_MAX = 500
 MAX_HOLDER_PAGES = 10
@@ -79,13 +83,13 @@ LAUNCH_SIG_PAGES = 6
 LAUNCH_TX_SAMPLE = 40
 SNIPER_SLOTS = 3
 
-DEX_MIN_INTERVAL = 1.2
+DEX_MIN_INTERVAL = float(os.getenv("DEX_MIN_INTERVAL", "0.8"))
 DEX_MAX_ATTEMPTS = 5
 DEX_BACKOFF_BASE = 2.0
 DEX_MAX_BACKOFF = 20.0
 DEX_MAX_RETRY_AFTER = 60.0
 DEX_TOTAL_DEADLINE = 100.0
-GECKO_MIN_INTERVAL = float(os.getenv("GECKO_MIN_INTERVAL", "1.5"))
+GECKO_MIN_INTERVAL = float(os.getenv("GECKO_MIN_INTERVAL", "1.2"))
 
 BURN_ADDRESSES = {"1nc1nerator11111111111111111111111111111111"}
 
@@ -312,6 +316,17 @@ def init_db() -> None:
             )
         """)
         db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user_active ON alerts(user_id, triggered)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                scans INTEGER DEFAULT 0
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)")
 
 def record_snapshot(mint: str, price: Optional[float], fdv: Optional[float], mc: Optional[float]) -> None:
     now = int(time.time())
@@ -347,6 +362,47 @@ def tracking_data(mint: str) -> dict[str, Any]:
         "ath_mc": ath[2] if ath else None,
         "old_24h": old,
         "scans": scans[0] if scans else None,
+    }
+
+# ---- User tracking (for /stats) ----
+def record_user(user_id: int, username: Optional[str], first_name: Optional[str]) -> None:
+    now = int(time.time())
+    with db_session() as db:
+        db.execute(
+            """INSERT INTO users(user_id, username, first_name, first_seen, last_seen, scans)
+               VALUES(?,?,?,?,?,0)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 username=excluded.username,
+                 first_name=excluded.first_name,
+                 last_seen=excluded.last_seen""",
+            (user_id, username, first_name, now, now),
+        )
+
+def record_scan(user_id: int) -> None:
+    with db_session() as db:
+        db.execute("UPDATE users SET scans = scans + 1 WHERE user_id=?", (user_id,))
+
+def stats_snapshot() -> dict[str, Any]:
+    now = int(time.time())
+    day = now - 86400
+    week = now - 7 * 86400
+    month = now - 30 * 86400
+    with db_session() as db:
+        total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        today = db.execute("SELECT COUNT(*) FROM users WHERE last_seen >= ?", (day,)).fetchone()[0]
+        week_count = db.execute("SELECT COUNT(*) FROM users WHERE last_seen >= ?", (week,)).fetchone()[0]
+        month_count = db.execute("SELECT COUNT(*) FROM users WHERE last_seen >= ?", (month,)).fetchone()[0]
+        total_scans = db.execute("SELECT COALESCE(SUM(scans), 0) FROM users").fetchone()[0]
+        top = db.execute(
+            "SELECT username, first_name, scans FROM users WHERE scans > 0 ORDER BY scans DESC LIMIT 10"
+        ).fetchall()
+    return {
+        "total": total,
+        "today": today,
+        "week": week_count,
+        "month": month_count,
+        "total_scans": total_scans,
+        "top": top,
     }
 
 # ------------------------------ HTTP / API -----------------------------------
@@ -432,7 +488,7 @@ async def dex_get_json(
                 break
             try:
                 response = await asyncio.wait_for(
-                    _http.get(url), timeout=min(25.0, remaining)
+                    _http.get(url), timeout=min(20.0, remaining)
                 )
             except (httpx.TransportError, asyncio.TimeoutError) as exc:
                 _dex_last_request = time.monotonic()
@@ -601,6 +657,7 @@ def _combine_pairs(matching: list[dict[str, Any]]) -> dict[str, Any]:
     return combined
 
 async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
+    # Fast path: return cached pair without waiting for any lock.
     cached = _cached_pair(mint)
     if cached is not None:
         return cached
@@ -1010,9 +1067,8 @@ def socials_from_pair(pair: dict[str, Any]) -> dict[str, bool]:
 # ------------------------------ FAST COLLECT --------------------------------
 async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
     """
-    Fast path: pair (DexScreener) + supply + authorities run in parallel.
-    ATH and paid-status run with SHORT timeouts and never block the report.
-    Deep scan adds holders + launch analysis but still respects timeouts.
+    Fast path: fire ALL slow tasks in parallel, then wait with short timeouts.
+    Nothing here should take more than ~6-8 seconds for a normal token.
     """
 
     async def timed(coro, timeout: float, label: str) -> Any:
@@ -1025,9 +1081,12 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
             log.warning("%s failed: %s", label, _scrub(str(exc)) or type(exc).__name__)
             return None
 
+    # Stage 1: fire pair + supply + authorities at once
     pair_task = asyncio.create_task(fetch_pair(mint))
-    supply_task = asyncio.create_task(fetch_supply(mint)) if HELIUS_KEY else None
-    auth_task = asyncio.create_task(timed(fetch_authorities(mint), AUTHORITY_TIMEOUT, "authorities")) if HELIUS_KEY else None
+    supply_task = asyncio.create_task(timed(fetch_supply(mint), 4.0, "supply")) if HELIUS_KEY else None
+    auth_task = asyncio.create_task(
+        timed(fetch_authorities(mint), AUTHORITY_TIMEOUT, "authorities")
+    ) if HELIUS_KEY else None
 
     pair = await pair_task
     if not pair:
@@ -1040,6 +1099,7 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
     created_ms = safe_num(pair.get("pairCreatedAt"))
     age_sec = time.time() - created_ms / 1000 if created_ms else None
 
+    # Stage 2: fire ATH + paid in parallel
     ath_task = asyncio.create_task(
         timed(fetch_ath(mint, pair.get("_pools") or [], age_sec, price), ATH_TIMEOUT, "ATH")
     )
@@ -1047,6 +1107,7 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
         timed(fetch_paid_status(mint), PAID_TIMEOUT, "paid status")
     )
 
+    # Stage 3: gather
     supply = await supply_task if supply_task else None
     authorities = await auth_task if auth_task else None
 
@@ -1170,7 +1231,6 @@ def market_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
         flags.append(("MEDIUM", "24h volume is over 5x MC (possible wash trading)"))
     if vol is not None and data.get("fdv") and data["fdv"] > 0 and vol < data["fdv"] * 0.01:
         flags.append(("MEDIUM", "Very low volume compared to FDV"))
-    # NEW: Volume vs Liquidity wash-trading check
     if vol is not None and liq is not None and liq > 0 and vol / liq > 5:
         flags.append(("MEDIUM", f"Volume is {vol / liq:.1f}x liquidity (possible wash trading)"))
     ratio = buy_ratio(data)
@@ -1233,7 +1293,6 @@ def verdict(data: dict[str, Any]) -> tuple[str, str]:
         return "🟡 WATCH", "Very new token with unusually high volume"
     if chg is not None and chg > 100 and liq is not None and vol is not None and vol > liq:
         return "🟡 WATCH", "Price is overheated. Wait for a pullback or confirmation"
-    # IMPROVED: use 1h change + lower ratio threshold
     ratio = buy_ratio(data)
     if (chg1h is not None and chg1h > 0 and ratio is not None and ratio >= 0.45
             and liq is not None and liq >= 25_000 and age is not None and age >= 3600):
@@ -1851,10 +1910,44 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
                 log.exception("Alert check failed for alert ID %s", alert_id)
                 continue
 
+# ------------------------------ STATS (admin only) ----------------------------
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message, user = update.effective_message, update.effective_user
+    if not message or not user:
+        return
+    if ADMIN_USER_ID and user.id != ADMIN_USER_ID:
+        await message.reply_text("This command is for the bot owner only.")
+        return
+    try:
+        s = await asyncio.to_thread(stats_snapshot)
+        lines = [
+            "📊 <b>BOT STATISTICS</b>",
+            BAR,
+            f"👥 Total users: <b>{s['total']:,}</b>",
+            f"🟢 Active today: <b>{s['today']:,}</b>",
+            f"📅 Active 7 days: <b>{s['week']:,}</b>",
+            f"🗓 Active 30 days: <b>{s['month']:,}</b>",
+            f"🔍 Total scans: <b>{s['total_scans']:,}</b>",
+        ]
+        if s["top"]:
+            lines += ["", "🏆 <b>Top users:</b>"]
+            for i, (username, first_name, scans) in enumerate(s["top"], 1):
+                name = f"@{username}" if username else (first_name or "?")
+                lines.append(f"{i}. {esc(name)} — {scans:,} scans")
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception:
+        log.exception("Could not load stats")
+        await message.reply_text("Could not load stats right now.")
 
 # ------------------------------ TELEGRAM -------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
+    if update.message and update.effective_user:
+        await asyncio.to_thread(
+            record_user,
+            update.effective_user.id,
+            update.effective_user.username,
+            update.effective_user.first_name,
+        )
         await update.message.reply_text(
             "🚀 <b>JABIR RUNNER V3</b>\n<i>See Beyond The Chart.</i>\n\n"
             "Send a Solana token address (CA) to scan it.\n"
@@ -1866,7 +1959,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
+    if update.message and update.effective_user:
+        await asyncio.to_thread(
+            record_user,
+            update.effective_user.id,
+            update.effective_user.username,
+            update.effective_user.first_name,
+        )
         await update.message.reply_text(
             "📖 <b>JABIR RUNNER V3 GUIDE</b>\n\n"
             "• Send a Solana CA to scan it.\n"
@@ -1927,8 +2026,11 @@ async def perform_scan(
 
 async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not message.text:
+    user = update.effective_user
+    if not message or not message.text or not user:
         return
+    # Track user
+    await asyncio.to_thread(record_user, user.id, user.username, user.first_name)
     match = SOL_ADDR_RE.search(message.text.strip())
     if not match:
         return
@@ -1939,11 +2041,19 @@ async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
     status = await message.reply_text("Scanning...")
     await perform_scan(mint, context, status_message=status, deep=False, announce=False)
+    await asyncio.to_thread(record_scan, user.id)
 
 async def preset_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
-    if update.message:
+    if update.message and update.effective_user:
+        await asyncio.to_thread(
+            record_user,
+            update.effective_user.id,
+            update.effective_user.username,
+            update.effective_user.first_name,
+        )
         status = await update.message.reply_text(f"Scanning {key.upper()}...")
         await perform_scan(TEST_TOKENS[key], context, status_message=status, deep=False, announce=False)
+        await asyncio.to_thread(record_scan, update.effective_user.id)
 
 async def testicles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await preset_scan(update, context, "testicles")
@@ -1961,6 +2071,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     if query.message is None:
         return
+    if update.effective_user:
+        await asyncio.to_thread(
+            record_user,
+            update.effective_user.id,
+            update.effective_user.username,
+            update.effective_user.first_name,
+        )
     raw = query.data or ""
     if ":" not in raw:
         return
@@ -1975,7 +2092,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def post_init(application: Application) -> None:
     global _http
     _http = httpx.AsyncClient(
-        timeout=httpx.Timeout(25.0, connect=10.0),
+        timeout=httpx.Timeout(20.0, connect=8.0),
         headers={"User-Agent": "JABIR-RUNNER/3.0"},
         limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),
     )
@@ -2012,6 +2129,7 @@ def main() -> None:
     app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CommandHandler("delalert", delalert_command))
     app.add_handler(CommandHandler("clearalerts", clearalerts_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     if app.job_queue is not None:
         app.job_queue.run_repeating(check_alerts, interval=120, first=10, name="price-alert-checker")
     else:
