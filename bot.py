@@ -66,17 +66,17 @@ LAUNCH_TIMEOUT = 20.0
 CACHE_MAX = 500
 MAX_HOLDER_PAGES = 10
 HOLDER_PAGE_SIZE = 1000
-LAUNCH_SIG_PAGES = 6        # up to 6,000 signatures searched for the launch transactions
-LAUNCH_TX_SAMPLE = 40       # earliest transactions analysed for bundles / snipers
-SNIPER_SLOTS = 3            # buys within this many slots after launch count as "snipers"
+LAUNCH_SIG_PAGES = 6
+LAUNCH_TX_SAMPLE = 40
+SNIPER_SLOTS = 3
 
-DEX_MIN_INTERVAL = 1.2      # minimum seconds between ANY two DexScreener requests
+DEX_MIN_INTERVAL = 1.2
 DEX_MAX_ATTEMPTS = 5
 DEX_BACKOFF_BASE = 2.0
 DEX_MAX_BACKOFF = 20.0
 DEX_MAX_RETRY_AFTER = 60.0
 DEX_TOTAL_DEADLINE = 100.0
-GECKO_MIN_INTERVAL = 2.2    # GeckoTerminal public API is limited (about 30 calls/min)
+GECKO_MIN_INTERVAL = 2.2
 
 BURN_ADDRESSES = {"1nc1nerator11111111111111111111111111111111"}
 
@@ -93,7 +93,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 for _noisy in ("httpx", "httpcore"):
-    # httpx logs full URLs at INFO level (they contain the bot token / Helius key)
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("jabir_runner")
 
@@ -216,10 +215,6 @@ def token_supply_text(supply: Optional[dict[str, Any]]) -> str:
         return "N/A"
 
 # ------------------------------ BASE58 / ED25519 -----------------------------
-# A Solana address that is NOT on the ed25519 curve can only be a program-controlled
-# account (PDA): bonding curves, pool vaults, program authorities. Real user wallets
-# are always on the curve. This lets us separate pool/program holders from real wallets
-# without any extra API call.
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _ED_P = 2 ** 255 - 19
 _ED_D = (-121665 * pow(121666, -1, _ED_P)) % _ED_P
@@ -347,14 +342,12 @@ def tracking_data(mint: str) -> dict[str, Any]:
 
 # ------------------------------ HTTP / API -----------------------------------
 def _scrub(text: str) -> str:
-    """Remove API keys/tokens from any text before it is logged."""
     for secret in (HELIUS_KEY, GROQ_KEY, BOT_TOKEN):
         if secret:
             text = text.replace(secret, "***")
     return text
 
 async def request_json(method: str, url: str, **kwargs: Any) -> Any:
-    """Generic JSON request used for Helius and Groq (NOT for DexScreener)."""
     if _http is None:
         raise RuntimeError("HTTP client is not initialized")
     last_error = "unknown error"
@@ -378,9 +371,7 @@ async def request_json(method: str, url: str, **kwargs: Any) -> Any:
                 await asyncio.sleep(0.5)
     raise RuntimeError(f"API request failed: {last_error}")
 
-# ---- DexScreener: shared rate limiter + retry ----
 def _get_dex_semaphore() -> asyncio.Semaphore:
-    """Created lazily so it always belongs to the running event loop."""
     global _dex_semaphore
     if _dex_semaphore is None:
         _dex_semaphore = asyncio.Semaphore(1)
@@ -410,11 +401,6 @@ def _dex_backoff(attempt: int) -> float:
 async def dex_get_json(
     url: str, *, max_attempts: int = DEX_MAX_ATTEMPTS, max_retry_after: float = DEX_MAX_RETRY_AFTER,
 ) -> Any:
-    """
-    The ONLY way the bot talks to DexScreener (token AND orders endpoints).
-    One request at a time, >= DEX_MIN_INTERVAL between requests, retries 429/5xx/network
-    errors (Retry-After honored), permanent 4xx errors are not retried.
-    """
     global _dex_last_request
     if _http is None:
         raise RuntimeError("HTTP client is not initialized")
@@ -482,7 +468,6 @@ async def dex_get_json(
         raise DexRateLimited(message)
     raise DexScreenerError(message)
 
-# ---- GeckoTerminal (used only for real ATH) ----
 def _get_gecko_semaphore() -> asyncio.Semaphore:
     global _gecko_semaphore
     if _gecko_semaphore is None:
@@ -490,7 +475,6 @@ def _get_gecko_semaphore() -> asyncio.Semaphore:
     return _gecko_semaphore
 
 async def gecko_get_json(url: str, params: dict[str, Any]) -> Any:
-    """Rate-limited GeckoTerminal call. Never raises: returns None on any problem."""
     global _gecko_last_request
     if _http is None:
         return None
@@ -517,7 +501,6 @@ async def gecko_get_json(url: str, params: dict[str, Any]) -> Any:
 
 @asynccontextmanager
 async def mint_lock(key: str) -> AsyncIterator[None]:
-    """Per-key async lock; entries are removed when nobody is using them."""
     entry = _mint_locks.get(key)
     if entry is None:
         entry = _LockEntry()
@@ -554,7 +537,6 @@ async def helius_rpc(method: str, params: Any) -> Any:
         raise RuntimeError(str(result["error"]))
     return result.get("result")
 
-# ---- DexScreener token data ----
 def _cached_pair(mint: str) -> Optional[dict[str, Any]]:
     entry = _cache.get(mint)
     if entry and time.time() - entry[0] < CACHE_TTL:
@@ -590,7 +572,6 @@ def _combine_pairs(matching: list[dict[str, Any]]) -> dict[str, Any]:
         combined["marketCap"] = next((p.get("marketCap") for p in matching if p.get("marketCap") is not None), None)
     if combined.get("fdv") is None:
         combined["fdv"] = next((p.get("fdv") for p in matching if p.get("fdv") is not None), None)
-    # Token age = oldest pair (a migrated pump.fun token keeps its launch time)
     created = [safe_num(p.get("pairCreatedAt")) for p in matching]
     created = [c for c in created if c]
     if created:
@@ -618,7 +599,6 @@ async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
         return None
 
     async with mint_lock(f"pair:{mint}"):
-        # Recheck after getting the lock: another scan may have just filled the cache.
         cached = _cached_pair(mint)
         if cached is not None:
             return cached
@@ -646,7 +626,6 @@ async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
         _missing_cache.pop(mint, None)
         return combined
 
-# ---- DexScreener orders (DEX Paid / Ads) ----
 def _cached_paid(mint: str) -> Any:
     entry = _paid_cache.get(mint)
     if not entry:
@@ -655,7 +634,6 @@ def _cached_paid(mint: str) -> Any:
     return entry[1] if time.time() - entry[0] < ttl else _MISS
 
 def parse_orders(orders: Any) -> Optional[dict[str, bool]]:
-    """DexScreener orders: [{type: tokenProfile|communityTakeover|tokenAd|trendingBarAd, status: ...}]"""
     if isinstance(orders, dict) and isinstance(orders.get("orders"), list):
         orders = orders["orders"]
     if not isinstance(orders, list):
@@ -678,7 +656,6 @@ async def fetch_paid_status(mint: str) -> Optional[dict[str, bool]]:
 
         result: Optional[dict[str, bool]] = None
         try:
-            # DEX Paid/Ads is optional: do not make the whole scan wait long for it
             orders = await dex_get_json(DEX_ORDERS_URL.format(mint), max_attempts=2, max_retry_after=8.0)
             result = parse_orders(orders)
             if result is None:
@@ -688,10 +665,9 @@ async def fetch_paid_status(mint: str) -> Optional[dict[str, bool]]:
             result = None
 
         _trim_cache(_paid_cache, PAID_CACHE_TTL)
-        _paid_cache[mint] = (time.time(), result)  # failures (None) are cached only briefly
+        _paid_cache[mint] = (time.time(), result)
         return result
 
-# ---- Helius: supply, authorities ----
 async def fetch_supply(mint: str) -> Optional[dict[str, Any]]:
     result = await helius_rpc("getTokenSupply", [mint, {"commitment": "confirmed"}])
     value = (result or {}).get("value") or {}
@@ -722,12 +698,12 @@ async def fetch_authorities(mint: str) -> Optional[dict[str, Any]]:
     if len(raw) < 82:
         return None
 
-    def authority(option_offset: int, key_offset: int) -> Optional[bool]:
+    def authority(option_offset: int) -> Optional[bool]:
         option = int.from_bytes(raw[option_offset:option_offset + 4], "little")
         return option == 1 if option in (0, 1) else None
 
-    mint_active = authority(0, 4)
-    freeze_active = authority(46, 50)
+    mint_active = authority(0)
+    freeze_active = authority(46)
     if mint_active is None or freeze_active is None:
         return None
     return {
@@ -737,12 +713,7 @@ async def fetch_authorities(mint: str) -> Optional[dict[str, Any]]:
         "layout": "standard SPL",
     }
 
-# ---- Helius: top holders (fast, runs on EVERY scan) ----
 async def fetch_top_accounts(mint: str) -> Optional[dict[str, Any]]:
-    """
-    Top 20 token accounts via getTokenLargestAccounts (1 call) + owners via
-    getMultipleAccounts (1 call). Fast even for tokens with millions of holders.
-    """
     entry = _holders_cache.get(mint)
     if entry and time.time() - entry[0] < HOLDERS_CACHE_TTL:
         return entry[1]
@@ -779,7 +750,6 @@ async def fetch_top_accounts(mint: str) -> Optional[dict[str, Any]]:
 def summarize_top_holders(
     top: Optional[dict[str, Any]], supply_raw: int, pool_addresses: set[str],
 ) -> Optional[dict[str, Any]]:
-    """Split the top accounts into real wallets vs pool/program/burn holders."""
     if not top or not top.get("entries") or supply_raw <= 0:
         return None
     wallets: list[tuple[str, float]] = []
@@ -799,11 +769,10 @@ def summarize_top_holders(
         "excluded_count": len(excluded),
         "excluded_percent": sum(s for _, s in excluded),
         "wallet_share": dict(wallets),
-        "complete": False,  # getTokenLargestAccounts only returns a top-20 sample
+        "complete": False,
         "cutoff_percent": min(all_shares) if all_shares else None,
     }
 
-# ---- Helius: full holder count (Deep Scan) ----
 async def fetch_holders(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
     if not HELIUS_KEY or supply_raw <= 0:
         return None
@@ -851,7 +820,6 @@ async def fetch_holders(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
         "reported_accounts": reported_total,
     }
 
-# ---- Helius: launch analysis - bundles / snipers / dev (ESTIMATE, Deep Scan only) ----
 def _fee_payer(tx: dict[str, Any]) -> Optional[str]:
     keys = nested(tx, "transaction", "message", "accountKeys")
     if isinstance(keys, list) and keys:
@@ -863,7 +831,6 @@ def _fee_payer(tx: dict[str, Any]) -> Optional[str]:
     return None
 
 def _token_deltas(tx: dict[str, Any], mint: str) -> dict[str, int]:
-    """Per-owner change in this token's balance inside one transaction."""
     meta = (tx or {}).get("meta") or {}
     pre: dict[str, int] = {}
     post: dict[str, int] = {}
@@ -876,13 +843,6 @@ def _token_deltas(tx: dict[str, Any], mint: str) -> dict[str, int]:
     return {owner: post.get(owner, 0) - pre.get(owner, 0) for owner in set(pre) | set(post)}
 
 def analyze_launch(txs: list[dict[str, Any]], mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
-    """
-    txs: parsed transactions, OLDEST FIRST. Estimates:
-    - creator: fee payer of the earliest successful transaction
-    - bundle: other real wallets that received the token in the launch slot
-    - snipers: other real wallets that received it within SNIPER_SLOTS slots after launch
-    Amounts are what they RECEIVED, not what they still hold.
-    """
     parsed = [t for t in txs if isinstance(t, dict) and safe_int(t.get("slot")) is not None]
     if not parsed or supply_raw <= 0:
         return None
@@ -925,7 +885,6 @@ def analyze_launch(txs: list[dict[str, Any]], mint: str, supply_raw: int) -> Opt
     }
 
 async def fetch_launch_buyers(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
-    """Find the oldest transactions of the mint (only possible when the token has <= ~6,000 txs)."""
     signatures: list[dict[str, Any]] = []
     before = None
     reached_start = False
@@ -945,7 +904,6 @@ async def fetch_launch_buyers(mint: str, supply_raw: int) -> Optional[dict[str, 
     if not reached_start or not signatures:
         return None
 
-    # pages come newest -> oldest; reverse to get oldest first
     oldest_first = [s for s in reversed(signatures) if not s.get("err")][:LAUNCH_TX_SAMPLE]
     if not oldest_first:
         return None
@@ -960,15 +918,12 @@ async def fetch_launch_buyers(mint: str, supply_raw: int) -> Optional[dict[str, 
             )
 
     results = await asyncio.gather(*(load(s["signature"]) for s in oldest_first), return_exceptions=True)
-    # gather keeps the input order, so the loaded transactions stay oldest first
     txs = [r for r in results if isinstance(r, dict)]
     return analyze_launch(txs, mint, supply_raw)
 
-# ---- GeckoTerminal: real ATH ----
 async def fetch_ath(
     mint: str, pools: list[dict[str, Any]], age_sec: Optional[float], price: Optional[float],
 ) -> Optional[dict[str, Any]]:
-    """Highest price seen in the pool candles (primary pool + oldest pool)."""
     if not pools or not price or price <= 0:
         return None
     entry = _ath_cache.get(mint)
@@ -1012,7 +967,7 @@ async def fetch_ath(
                 return None
             newest = max(rows, key=lambda r: r[0])
             if newest[2] and not (0.2 <= newest[2] / price <= 5):
-                return None  # candle prices do not match this token (wrong side of the pair)
+                return None
             best = max(rows, key=lambda r: r[1])
             return best[0], best[1]
 
@@ -1044,8 +999,6 @@ def socials_from_pair(pair: dict[str, Any]) -> dict[str, bool]:
     }
 
 async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
-    """Everything runs in parallel: DexScreener, Helius and GeckoTerminal do not wait for each other."""
-
     async def pair_and_ath() -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
         pair = await fetch_pair(mint)
         if not pair:
@@ -1120,7 +1073,6 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
     if first and first[1] and price is not None and first[1] > 0 and now - first[0] >= 300:
         since_first = (price / first[1] - 1) * 100
 
-    # ATH: real chart data first, bot-tracked data as fallback
     mc_ref = mc if mc is not None else fdv
     mc_per_price = (mc_ref / price) if (mc_ref and price) else None
     ath: Optional[dict[str, Any]] = None
@@ -1194,7 +1146,6 @@ def market_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
     age = data.get("age_sec")
     if liq is not None and liq < 10_000:
         flags.append(("HIGH", "Liquidity below $10K"))
-    # LP/MC check only for small/mid caps ($100K - $50M); large caps normally have low ratios
     if liq is not None and mc and 100_000 <= mc <= 50_000_000 and liq / mc < 0.02:
         flags.append(("HIGH", f"LP/MC very thin ({liq / mc * 100:.1f}%)"))
     elif liq is not None and mc and 100_000 <= mc <= 50_000_000 and liq / mc < 0.05:
@@ -1212,7 +1163,6 @@ def market_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
     return flags
 
 def all_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
-    """Market + on-chain + holder + launch flags. HIGH flags first."""
     flags = market_flags(data)
     authorities = data.get("authorities") or {}
     if authorities.get("mint_authority_active") is True:
@@ -1272,7 +1222,6 @@ def verdict(data: dict[str, Any]) -> tuple[str, str]:
     return "🟡 WATCH", "No clear momentum yet"
 
 def fallback_narrative(data: dict[str, Any]) -> str:
-    """Rule-based one-liner used when the AI is slow or unavailable."""
     socials = data.get("socials") or {}
     links = [label for label, ok in (("X", socials.get("x")), ("website", socials.get("web")), ("Telegram", socials.get("tg"))) if ok]
     links_text = "has " + ", ".join(links) + " links" if links else "has no social links listed"
@@ -1311,7 +1260,7 @@ async def groq_narrative(data: dict[str, Any]) -> str:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": 800,  # gpt-oss thinks first; thinking tokens count toward this limit
+            "max_tokens": 800,
         }
         if "gpt-oss" in GROQ_MODEL.lower():
             payload["reasoning_effort"] = "low"
@@ -1348,7 +1297,6 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
         f"N/A (FDV {money(data.get('fdv'))})" if data.get("fdv") is not None else "N/A"
     )
 
-    # ATH
     ath = data.get("ath")
     if ath and ath.get("mc") is not None and ath.get("distance") is not None:
         when = ""
@@ -1361,7 +1309,6 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
     else:
         ath_line = "🏔 ATH: N/A"
 
-    # Since first scan / scans
     track_bits = []
     if data.get("since_first") is not None and data.get("first_seen"):
         track_bits.append(f"Since 1st scan {data['since_first']:+.1f}% ({age_text(time.time() - data['first_seen'])} ago)")
@@ -1369,13 +1316,11 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
         track_bits.append(f"Scans: {data['scans']}")
     track_line = "📈 " + " | ".join(track_bits) if track_bits else ""
 
-    # Mint / freeze
     def authority_text(key: str) -> str:
         if not authorities:
             return "N/A"
         return "ACTIVE ⚠️" if authorities.get(key) is True else "revoked ✅"
 
-    # Holders
     if top.get("top10_percent") is not None:
         label = "Top 10" if top.get("top_count", 0) >= 10 else f"Top {top.get('top_count')}"
         holders_line = f"👥 {label}: {top['top10_percent']:.1f}%"
@@ -1392,7 +1337,6 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
     elif holders.get("accounts_scanned") and not holders.get("complete"):
         holders_line += f"\n    Total holders: {fmt_count(holders['accounts_scanned'])}+ (scan limit)"
 
-    # Launch (Deep Scan)
     if launch:
         extra = [
             f"📦 Bundle (est.): {launch['bundle_count']} wallets in launch block "
@@ -1416,7 +1360,6 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
     else:
         launch_block = "📦 Bundles/snipers/dev: tap Deep Scan"
 
-    # Risk
     if flags:
         level = "🔴" if any(l == "HIGH" for l, _ in flags) else "🟡"
         risk_text = f"{level} " + "; ".join(t for _, t in flags[:3])
@@ -1483,7 +1426,6 @@ DEX_TRENDING_URL = "https://api.dexscreener.com/latest/dex/tokens/trending"
 DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q=solana"
 
 def _trending_items(payload: Any) -> list[dict[str, Any]]:
-    """Accept the common DexScreener list/dict response shapes."""
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
     if isinstance(payload, dict):
@@ -1524,14 +1466,12 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         best: dict[str, dict[str, Any]] = {}
 
-        # TRY 1: Search - yafi Trending kawo coins masu tashi
         try:
             payload = await dex_get_json(DEX_SEARCH_URL)
             best = _pick_runners(_trending_items(payload), min_chg=5, min_liq=1000)
         except Exception:
             best = {}
 
-        # TRY 2: Idan Search bai samu ba, gwada Trending da filter mai sauki
         if not best:
             try:
                 payload = await dex_get_json(DEX_TRENDING_URL)
@@ -1539,7 +1479,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except Exception:
                 pass
 
-        # TRY 3: Idan har yanzu babu, nuna Trending ba tare da filter ba
         if not best:
             try:
                 payload = await dex_get_json(DEX_TRENDING_URL)
@@ -1587,7 +1526,24 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 url = f"https://dexscreener.com/solana/{mint}"
             lines.append(
                 f"<b>#{rank} ${esc(symbol)}</b>  <b>{pct(change)}</b>\n"
-                f"MC {money(mc)} | LP {
+                f"MC {money(mc)} | LP {money(lp)} | Vol {money(vol)}"
+            )
+            if rank <= 5:
+                buttons.append([InlineKeyboardButton(f"📈 #{rank} ${symbol[:16]} Chart", url=url)])
+        lines += ["", "<i>Trending data is a snapshot, not a safety rating.</i>"]
+        await status.edit_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+            disable_web_page_preview=True,
+        )
+    except DexRateLimited:
+        await status.edit_text("⏳ DexScreener rate limit reached. Try again in 1 minute.")
+    except DexScreenerError as exc:
+        log.warning("/runners DexScreener error: %s", exc)
+        await status.edit_text("❌ DexScreener is unavailable right now. Please try again shortly.")
+    except Exception:
+        log.exception("/runners failed")
+        await status.edit_text("❌ Could not load runners right now. Please try again later.")
 
 # ------------------------------ PRICE ALERTS ----------------------------------
 def _valid_mint(value: str) -> bool:
@@ -1606,7 +1562,7 @@ def _create_alert(
     user_id: int, chat_id: int, mint: str, symbol: str,
     target_price: float, direction: str, base_price: float,
     percent: Optional[float],
-) -> int:
+) -> Optional[int]:
     with db_session() as db:
         db.execute("BEGIN IMMEDIATE")
         active = db.execute(
@@ -1765,9 +1721,11 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         for row in rows:
             alert_id, mint, symbol, target, direction, base, percent, created, triggered = row
             status = "✅ TRIGGERED" if triggered else "🟢 ACTIVE"
+            target_num = safe_num(target)
+            target_text = format(target_num, ".12g") if target_num is not None else "N/A"
             lines.append(
                 f"<b>#{alert_id} ${esc(symbol or '?')}</b> · {status}\n"
-                f"Target: <code>{format(safe_num(target), '.12g') if safe_num(target) is not None else 'N/A'}</code> · {esc(direction)}\n"
+                f"Target: <code>{target_text}</code> · {esc(direction)}\n"
                 f"<code>{esc(mint)}</code>"
             )
         lines.append("\nUse /delalert ID to delete one, /clearalerts to delete all.")
@@ -1802,7 +1760,6 @@ async def clearalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text("❌ Could not clear alerts.")
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Background alert monitor. One pass at a time; each token uses fetch_pair cache."""
     global _alerts_check_lock
     if _alerts_check_lock is None:
         _alerts_check_lock = asyncio.Lock()
@@ -1831,7 +1788,6 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 if not hit:
                     continue
-                # Mark first, so a Telegram/network error cannot cause repeated spam.
                 marked = await asyncio.to_thread(_mark_alert_triggered, alert_id)
                 if not marked:
                     continue
@@ -1869,7 +1825,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "📖 <b>JABIR RUNNER V3 GUIDE</b>\n\n"
             "• Send a Solana CA to scan it.\n"
             "• /testicles, /pengu, /grokius are quick tests.\n"
-            "• /runners lists today's top Solana runners (24h +20%, LP $5K+).\n"
+            "• /runners lists today's top Solana runners (24h +5%, LP $1K+).\n"
             "• <code>/alert CA 0.001 above</code> or <code>/alert CA +50%</code> creates a price alert.\n"
             "• <code>/alerts</code> lists alerts; <code>/delalert ID</code> deletes one; <code>/clearalerts</code> deletes all.\n"
             "• Refresh updates the market data.\n"
@@ -1886,7 +1842,6 @@ async def perform_scan(
     announce: bool = True,
 ) -> None:
     async def notify(text: str) -> None:
-        """Send a plain error notice without ever raising."""
         try:
             if status_message:
                 await status_message.edit_text(text)
@@ -1994,6 +1949,8 @@ def main() -> None:
         raise SystemExit("Missing RENDER_EXTERNAL_URL")
     if not WEBHOOK_SECRET:
         raise SystemExit("Missing WEBHOOK_SECRET")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET):
+        raise SystemExit("WEBHOOK_SECRET must be 1-256 chars of A-Z, a-z, 0-9, _ or -")
 
     app = (
         Application.builder().token(BOT_TOKEN).concurrent_updates(True)
