@@ -63,9 +63,16 @@ HOLDERS_CACHE_TTL = 120
 ATH_CACHE_TTL = 300
 ATH_FAIL_TTL = 60
 NARRATIVE_CACHE_TTL = 300
-NARRATIVE_TIMEOUT = 6.0
-ATH_TIMEOUT = 6.0
-LAUNCH_TIMEOUT = 20.0
+
+# ---- FAST TIMEOUTS (scan should finish in ~5-8s) ----
+ATH_TIMEOUT = float(os.getenv("ATH_TIMEOUT", "3.0"))
+NARRATIVE_TIMEOUT = float(os.getenv("NARRATIVE_TIMEOUT", "3.5"))
+AUTHORITY_TIMEOUT = float(os.getenv("AUTHORITY_TIMEOUT", "3.0"))
+PAID_TIMEOUT = float(os.getenv("PAID_TIMEOUT", "3.0"))
+TOP_HOLDERS_TIMEOUT = float(os.getenv("TOP_HOLDERS_TIMEOUT", "6.0"))
+FULL_HOLDERS_TIMEOUT = float(os.getenv("FULL_HOLDERS_TIMEOUT", "12.0"))
+LAUNCH_TIMEOUT = float(os.getenv("LAUNCH_TIMEOUT", "20.0"))
+
 CACHE_MAX = 500
 MAX_HOLDER_PAGES = 10
 HOLDER_PAGE_SIZE = 1000
@@ -79,7 +86,7 @@ DEX_BACKOFF_BASE = 2.0
 DEX_MAX_BACKOFF = 20.0
 DEX_MAX_RETRY_AFTER = 60.0
 DEX_TOTAL_DEADLINE = 100.0
-GECKO_MIN_INTERVAL = 2.2
+GECKO_MIN_INTERVAL = float(os.getenv("GECKO_MIN_INTERVAL", "1.5"))
 
 BURN_ADDRESSES = {"1nc1nerator11111111111111111111111111111111"}
 
@@ -1001,71 +1008,84 @@ def socials_from_pair(pair: dict[str, Any]) -> dict[str, bool]:
         "tg": any("telegram" in x or "t.me" in x for x in values),
     }
 
+# ------------------------------ FAST COLLECT --------------------------------
 async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
-    async def pair_and_ath() -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
-        pair = await fetch_pair(mint)
-        if not pair:
-            return None, None
-        created = safe_num(pair.get("pairCreatedAt"))
-        age = time.time() - created / 1000 if created else None
-        ath = None
+    """
+    Fast path: pair (DexScreener) + supply + authorities run in parallel.
+    ATH and paid-status run with SHORT timeouts and never block the report.
+    Deep scan adds holders + launch analysis but still respects timeouts.
+    """
+
+    async def timed(coro, timeout: float, label: str) -> Any:
         try:
-            ath = await asyncio.wait_for(
-                fetch_ath(mint, pair.get("_pools") or [], age, safe_num(pair.get("priceUsd"))),
-                ATH_TIMEOUT,
-            )
+            return await asyncio.wait_for(coro, timeout)
+        except asyncio.TimeoutError:
+            log.warning("%s timed out after %.1fs", label, timeout)
+            return None
         except Exception as exc:
-            log.warning("ATH lookup failed: %s", type(exc).__name__)
-        return pair, ath
+            log.warning("%s failed: %s", label, _scrub(str(exc)) or type(exc).__name__)
+            return None
 
-    async def helius_chain() -> dict[str, Any]:
-        if not HELIUS_KEY:
-            return {}
-        supply = await fetch_supply(mint)
-        out: dict[str, Any] = {"supply": supply}
-        if not supply:
-            return out
-        jobs: dict[str, Any] = {"top": fetch_top_accounts(mint)}
-        if deep:
-            jobs["holders"] = fetch_holders(mint, supply["raw"])
-            jobs["launch"] = asyncio.wait_for(fetch_launch_buyers(mint, supply["raw"]), LAUNCH_TIMEOUT)
-        results = await asyncio.gather(*jobs.values(), return_exceptions=True)
-        for key, value in zip(jobs, results):
-            if isinstance(value, Exception):
-                log.warning("%s lookup failed: %s", key, _scrub(str(value)) or type(value).__name__)
-                value = None
-            out[key] = value
-        return out
+    # 1) Fire the slowest independent task FIRST so it overlaps with everything else.
+    pair_task = asyncio.create_task(fetch_pair(mint))
+    supply_task = asyncio.create_task(fetch_supply(mint)) if HELIUS_KEY else None
+    auth_task = asyncio.create_task(timed(fetch_authorities(mint), AUTHORITY_TIMEOUT, "authorities")) if HELIUS_KEY else None
 
-    authority_task = fetch_authorities(mint) if HELIUS_KEY else asyncio.sleep(0, result=None)
-    pair_res, paid_res, helius_res, authorities = await asyncio.gather(
-        pair_and_ath(), fetch_paid_status(mint), helius_chain(), authority_task,
-        return_exceptions=True,
-    )
-    if isinstance(pair_res, Exception):
-        raise pair_res
-    pair, ath_info = pair_res
+    pair = await pair_task
     if not pair:
+        for t in (supply_task, auth_task):
+            if t:
+                t.cancel()
         raise ValueError("No Solana pair found for this token address.")
-    for label, value in (("paid", paid_res), ("helius", helius_res), ("authorities", authorities)):
-        if isinstance(value, Exception):
-            log.warning("%s lookup failed: %s", label, _scrub(str(value)) or type(value).__name__)
-    paid = None if isinstance(paid_res, Exception) else paid_res
-    helius = {} if isinstance(helius_res, Exception) else helius_res
-    if isinstance(authorities, Exception):
-        authorities = None
 
+    # 2) Once we have the pair, fire ATH + paid status in parallel with supply/auth.
+    price = safe_num(pair.get("priceUsd"))
+    created_ms = safe_num(pair.get("pairCreatedAt"))
+    age_sec = time.time() - created_ms / 1000 if created_ms else None
+
+    ath_task = asyncio.create_task(
+        timed(fetch_ath(mint, pair.get("_pools") or [], age_sec, price), ATH_TIMEOUT, "ATH")
+    )
+    paid_task = asyncio.create_task(
+        timed(fetch_paid_status(mint), PAID_TIMEOUT, "paid status")
+    )
+
+    # 3) Collect supply + authorities (already running).
+    supply = await supply_task if supply_task else None
+    authorities = await auth_task if auth_task else None
+
+    # 4) Top holders needs supply (raw) — fire it now.
+    top_task = None
+    holders_task = None
+    launch_task = None
+    if supply:
+        top_task = asyncio.create_task(
+            timed(fetch_top_accounts(mint), TOP_HOLDERS_TIMEOUT, "top holders")
+        )
+        if deep:
+            holders_task = asyncio.create_task(
+                timed(fetch_holders(mint, supply["raw"]), FULL_HOLDERS_TIMEOUT, "full holders")
+            )
+            launch_task = asyncio.create_task(
+                timed(fetch_launch_buyers(mint, supply["raw"]), LAUNCH_TIMEOUT, "launch buyers")
+            )
+
+    # 5) Await the results.
+    ath_info = await ath_task
+    paid = await paid_task
+    top = await top_task if top_task else None
+    holders = await holders_task if holders_task else None
+    launch = await launch_task if launch_task else None
+
+    # 6) Build the result dict.
     base = pair.get("baseToken") or {}
     volume, changes = pair.get("volume") or {}, pair.get("priceChange") or {}
     txns = pair.get("txns") or {}
     h1, h24 = txns.get("h1") or {}, txns.get("h24") or {}
 
-    price = safe_num(pair.get("priceUsd"))
     fdv, mc = safe_num(pair.get("fdv")), safe_num(pair.get("marketCap"))
     liq = safe_num(nested(pair, "liquidity", "usd"))
-    created_ms = safe_num(pair.get("pairCreatedAt"))
     created_ts = created_ms / 1000 if created_ms else None
-    age_sec = time.time() - created_ts if created_ts else None
 
     await asyncio.to_thread(record_snapshot, mint, price, fdv, mc)
     tracking = await asyncio.to_thread(tracking_data, mint)
@@ -1090,15 +1110,13 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
         ath["distance"] = (price / ath["price"] - 1) * 100 if ath["price"] > 0 else None
         ath["mc"] = ath["price"] * mc_per_price if mc_per_price else None
 
-    supply = helius.get("supply")
     pools = pair.get("_pools") or []
     pool_set = {p["address"] for p in pools if p.get("address")}
     pool_set.add(pair.get("pairAddress") or "")
     top_holders = None
-    if supply and helius.get("top"):
-        top_holders = summarize_top_holders(helius["top"], supply["raw"], pool_set)
+    if supply and top:
+        top_holders = summarize_top_holders(top, supply["raw"], pool_set)
 
-    launch = helius.get("launch")
     dev = None
     if launch and launch.get("creator"):
         creator = launch["creator"]
@@ -1126,7 +1144,7 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
         "created_ts": created_ts, "age_sec": age_sec,
         "ath": ath, "since_first": since_first, "scans": tracking.get("scans"),
         "supply": supply, "authorities": authorities,
-        "top_holders": top_holders, "holders": helius.get("holders"),
+        "top_holders": top_holders, "holders": holders,
         "launch": launch, "dev": dev, "deep": deep,
         "socials": socials_from_pair(pair),
         "dex_paid": paid.get("paid") if paid else None,
@@ -1448,7 +1466,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         async def fetch_trending() -> list:
             try:
-                # Search for trending Solana tokens
                 payload = await dex_get_json(f"{DEX_SEARCH_URL}?q=solana")
                 if isinstance(payload, dict) and isinstance(payload.get("pairs"), list):
                     return payload["pairs"]
@@ -1470,8 +1487,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 token_addr = item.get("tokenAddress")
                 if not token_addr or not SOL_ADDR_RE.fullmatch(token_addr):
                     continue
-                # Boosts don't have pair data; we'll fetch it later via search or tokens endpoint
-                # Store minimal info for now
                 candidates.setdefault(token_addr, {"_needs_pair": True, "_boost_item": item})
 
         # Process trending/search pairs directly
@@ -1485,7 +1500,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 token_addr = base.get("address")
                 if not token_addr or not SOL_ADDR_RE.fullmatch(token_addr):
                     continue
-                # If we already have this mint from boosts, merge
                 existing = candidates.get(token_addr)
                 if existing and existing.get("_needs_pair"):
                     existing["_pair_data"] = item
@@ -1498,8 +1512,7 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if data.get("_needs_pair") and not data.get("_pair_data")
         ]
         if tokens_to_fetch:
-            # Fetch in batches to avoid too many requests
-            for mint in tokens_to_fetch[:15]:  # limit to avoid rate limits
+            for mint in tokens_to_fetch[:15]:
                 try:
                     pair = await fetch_pair(mint)
                     if pair:
@@ -1518,7 +1531,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not pair or not isinstance(pair, dict):
                 continue
 
-            # Extract fields
             base = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
             symbol = str(base.get("symbol") or "?")
             mc = safe_num(pair.get("marketCap")) or safe_num(pair.get("fdv"))
@@ -1527,7 +1539,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             change = safe_num(nested(pair, "priceChange", "h24"))
             url = pair.get("url")
 
-            # Apply filters: MC > $100K, LP > $5K, Vol 24h > $10K, 24h change > +5%
             if mc is None or mc <= 100_000:
                 continue
             if liq is None or liq <= 5_000:
@@ -1551,7 +1562,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             })
             seen_mints.add(mint)
 
-        # Sort by volume (descending) and take top 10
         results.sort(key=lambda x: x["vol"], reverse=True)
         ranked = results[:10]
 
