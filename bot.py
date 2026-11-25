@@ -1,12 +1,15 @@
 """
-JABIR RUNNER V3 - FINAL MERGED (Claude Backend + Clean Report)
+JABIR RUNNER V3 - TRADER EDITION
 Solana token scanner | Python 3.11 | python-telegram-bot 21+
-DexScreener + Helius + Groq | Render Webhook
+DexScreener + GeckoTerminal + Helius + Groq | Render Webhook
+
+Optional env vars: CACHE_TTL (default 60), PAID_CACHE_TTL (default 300), GROQ_MODEL
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import html
 import json
 import logging
@@ -44,6 +47,7 @@ WEBHOOK_PATH = "telegram-webhook"
 
 DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 DEX_ORDERS_URL = "https://api.dexscreener.com/orders/v1/solana/{}"
+GECKO_OHLCV_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/{timeframe}"
 HELIUS_RPC_URL = "https://mainnet.helius-rpc.com/"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -52,16 +56,29 @@ CACHE_TTL = int(os.getenv("CACHE_TTL", "60"))
 PAID_CACHE_TTL = int(os.getenv("PAID_CACHE_TTL", "300"))
 PAID_FAIL_TTL = 30
 NOT_FOUND_TTL = 20
+HOLDERS_CACHE_TTL = 120
+ATH_CACHE_TTL = 300
+ATH_FAIL_TTL = 60
+NARRATIVE_CACHE_TTL = 300
+NARRATIVE_TIMEOUT = 6.0
+ATH_TIMEOUT = 6.0
+LAUNCH_TIMEOUT = 20.0
 CACHE_MAX = 500
 MAX_HOLDER_PAGES = 10
 HOLDER_PAGE_SIZE = 1000
+LAUNCH_SIG_PAGES = 6        # up to 6,000 signatures searched for the launch transactions
+LAUNCH_TX_SAMPLE = 40       # earliest transactions analysed for bundles / snipers
+SNIPER_SLOTS = 3            # buys within this many slots after launch count as "snipers"
 
-DEX_MIN_INTERVAL = 1.2
+DEX_MIN_INTERVAL = 1.2      # minimum seconds between ANY two DexScreener requests
 DEX_MAX_ATTEMPTS = 5
 DEX_BACKOFF_BASE = 2.0
 DEX_MAX_BACKOFF = 20.0
 DEX_MAX_RETRY_AFTER = 60.0
 DEX_TOTAL_DEADLINE = 100.0
+GECKO_MIN_INTERVAL = 2.2    # GeckoTerminal public API is limited (about 30 calls/min)
+
+BURN_ADDRESSES = {"1nc1nerator11111111111111111111111111111111"}
 
 TEST_TOKENS = {
     "testicles": "3pGmCpDCr2B6cZFhFJFtLrcMCadMvjV4dB9UGJyNpump",
@@ -76,27 +93,39 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 for _noisy in ("httpx", "httpcore"):
+    # httpx logs full URLs at INFO level (they contain the bot token / Helius key)
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("jabir_runner")
+
 _http: Optional[httpx.AsyncClient] = None
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _missing_cache: dict[str, tuple[float, None]] = {}
-_paid_cache: dict[str, tuple[float, Optional[bool]]] = {}
+_paid_cache: dict[str, tuple[float, Optional[dict[str, bool]]]] = {}
+_holders_cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
+_ath_cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
+_narrative_cache: dict[str, tuple[float, str]] = {}
 _dex_semaphore: Optional[asyncio.Semaphore] = None
+_gecko_semaphore: Optional[asyncio.Semaphore] = None
 _dex_last_request: float = -1e9
+_gecko_last_request: float = -1e9
 _MISS = object()
 
+
 class DexScreenerError(RuntimeError):
-    pass
+    """DexScreener request failed (permanent 4xx, repeated 5xx/network errors, bad data)."""
+
 
 class DexRateLimited(DexScreenerError):
-    pass
+    """DexScreener kept answering HTTP 429 after all retries."""
+
 
 class _LockEntry:
     __slots__ = ("lock", "users")
+
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.users = 0
+
 
 _mint_locks: dict[str, _LockEntry] = {}
 
@@ -185,6 +214,45 @@ def token_supply_text(supply: Optional[dict[str, Any]]) -> str:
     except Exception:
         return "N/A"
 
+# ------------------------------ BASE58 / ED25519 -----------------------------
+# A Solana address that is NOT on the ed25519 curve can only be a program-controlled
+# account (PDA): bonding curves, pool vaults, program authorities. Real user wallets
+# are always on the curve. This lets us separate pool/program holders from real wallets
+# without any extra API call.
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_ED_P = 2 ** 255 - 19
+_ED_D = (-121665 * pow(121666, -1, _ED_P)) % _ED_P
+
+def b58decode(text: str) -> Optional[bytes]:
+    number = 0
+    for char in text:
+        index = _B58.find(char)
+        if index < 0:
+            return None
+        number = number * 58 + index
+    body = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
+    leading_zeros = len(text) - len(text.lstrip("1"))
+    return b"\x00" * leading_zeros + body
+
+@functools.lru_cache(maxsize=4096)
+def is_on_curve(address: str) -> Optional[bool]:
+    """True = normal wallet key, False = program-derived (PDA), None = invalid address."""
+    raw = b58decode(address)
+    if raw is None or len(raw) != 32:
+        return None
+    value = int.from_bytes(raw, "little")
+    sign_bit = value >> 255
+    y = (value & ((1 << 255) - 1)) % _ED_P
+    y2 = y * y % _ED_P
+    u = (y2 - 1) % _ED_P
+    v = (_ED_D * y2 + 1) % _ED_P
+    if v == 0:
+        return False
+    x2 = u * pow(v, -1, _ED_P) % _ED_P
+    if x2 == 0:
+        return sign_bit == 0
+    return pow(x2, (_ED_P - 1) // 2, _ED_P) == 1
+
 # ------------------------------ DATABASE -------------------------------------
 def db_connect() -> sqlite3.Connection:
     db = sqlite3.connect(DB_PATH, timeout=20)
@@ -236,16 +304,26 @@ def tracking_data(mint: str) -> dict[str, Any]:
             "SELECT price, fdv, mc, ts FROM snapshots WHERE mint=? AND ts<=? ORDER BY ts DESC LIMIT 1",
             (mint, now - 23 * 3600),
         ).fetchone()
-    return {"first": first, "ath_price": ath[0] if ath else None, "ath_fdv": ath[1] if ath else None, "ath_mc": ath[2] if ath else None, "old_24h": old}
+        scans = db.execute("SELECT COUNT(*) FROM snapshots WHERE mint=?", (mint,)).fetchone()
+    return {
+        "first": first,
+        "ath_price": ath[0] if ath else None,
+        "ath_fdv": ath[1] if ath else None,
+        "ath_mc": ath[2] if ath else None,
+        "old_24h": old,
+        "scans": scans[0] if scans else None,
+    }
 
 # ------------------------------ HTTP / API -----------------------------------
 def _scrub(text: str) -> str:
+    """Remove API keys/tokens from any text before it is logged."""
     for secret in (HELIUS_KEY, GROQ_KEY, BOT_TOKEN):
         if secret:
             text = text.replace(secret, "***")
     return text
 
 async def request_json(method: str, url: str, **kwargs: Any) -> Any:
+    """Generic JSON request used for Helius and Groq (NOT for DexScreener)."""
     if _http is None:
         raise RuntimeError("HTTP client is not initialized")
     last_error = "unknown error"
@@ -265,7 +343,9 @@ async def request_json(method: str, url: str, **kwargs: Any) -> Any:
                 await asyncio.sleep(0.5)
     raise RuntimeError(f"API request failed: {last_error}")
 
+# ---- DexScreener: shared rate limiter + retry ----
 def _get_dex_semaphore() -> asyncio.Semaphore:
+    """Created lazily so it always belongs to the running event loop."""
     global _dex_semaphore
     if _dex_semaphore is None:
         _dex_semaphore = asyncio.Semaphore(1)
@@ -292,18 +372,28 @@ def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
 def _dex_backoff(attempt: int) -> float:
     return min(DEX_MAX_BACKOFF, DEX_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0.0, 1.0))
 
-async def dex_get_json(url: str, *, max_attempts: int = DEX_MAX_ATTEMPTS, max_retry_after: float = DEX_MAX_RETRY_AFTER) -> Any:
+async def dex_get_json(
+    url: str, *, max_attempts: int = DEX_MAX_ATTEMPTS, max_retry_after: float = DEX_MAX_RETRY_AFTER,
+) -> Any:
+    """
+    The ONLY way the bot talks to DexScreener (token AND orders endpoints).
+    One request at a time, >= DEX_MIN_INTERVAL between requests, retries 429/5xx/network
+    errors (Retry-After honored), permanent 4xx errors are not retried.
+    """
     global _dex_last_request
     if _http is None:
         raise RuntimeError("HTTP client is not initialized")
+
     async with _get_dex_semaphore():
         started = time.monotonic()
         problem = "unknown error"
         was_rate_limited = False
+        attempt = 0
         for attempt in range(1, max_attempts + 1):
             gap = DEX_MIN_INTERVAL - (time.monotonic() - _dex_last_request)
             if gap > 0:
                 await asyncio.sleep(gap)
+
             wait = _dex_backoff(attempt)
             was_rate_limited = False
             try:
@@ -320,7 +410,10 @@ async def dex_get_json(url: str, *, max_attempts: int = DEX_MAX_ATTEMPTS, max_re
                     retry_after = _retry_after_seconds(response)
                     if retry_after is not None:
                         if retry_after > max_retry_after:
-                            raise DexRateLimited(f"HTTP 429, Retry-After {retry_after:.0f}s is above the {max_retry_after:.0f}s limit")
+                            raise DexRateLimited(
+                                f"HTTP 429, Retry-After {retry_after:.0f}s is above the "
+                                f"{max_retry_after:.0f}s limit"
+                            )
                         wait = retry_after + random.uniform(0.0, 0.5)
                 elif status >= 500:
                     problem = f"HTTP {status} server error"
@@ -331,20 +424,59 @@ async def dex_get_json(url: str, *, max_attempts: int = DEX_MAX_ATTEMPTS, max_re
                         return response.json()
                     except ValueError:
                         problem = "invalid JSON in response"
+
             if attempt >= max_attempts:
                 break
             if time.monotonic() - started + wait > DEX_TOTAL_DEADLINE:
                 problem += f" (total wait limit {DEX_TOTAL_DEADLINE:.0f}s reached)"
                 break
-            log.warning("DexScreener %s (attempt %d/%d) - retrying in %.1fs", problem, attempt, max_attempts, wait)
+            log.warning(
+                "DexScreener %s (attempt %d/%d) - retrying in %.1fs",
+                problem, attempt, max_attempts, wait,
+            )
             await asyncio.sleep(wait)
+
     message = f"{problem} after {attempt} attempt(s)"
     if was_rate_limited:
         raise DexRateLimited(message)
     raise DexScreenerError(message)
 
+# ---- GeckoTerminal (used only for real ATH) ----
+def _get_gecko_semaphore() -> asyncio.Semaphore:
+    global _gecko_semaphore
+    if _gecko_semaphore is None:
+        _gecko_semaphore = asyncio.Semaphore(1)
+    return _gecko_semaphore
+
+async def gecko_get_json(url: str, params: dict[str, Any]) -> Any:
+    """Rate-limited GeckoTerminal call. Never raises: returns None on any problem."""
+    global _gecko_last_request
+    if _http is None:
+        return None
+    async with _get_gecko_semaphore():
+        gap = GECKO_MIN_INTERVAL - (time.monotonic() - _gecko_last_request)
+        if gap > 0:
+            await asyncio.sleep(gap)
+        try:
+            response = await _http.get(
+                url, params=params, headers={"Accept": "application/json;version=20230302"}
+            )
+        except httpx.HTTPError as exc:
+            _gecko_last_request = time.monotonic()
+            log.warning("GeckoTerminal request failed: %s", type(exc).__name__)
+            return None
+        _gecko_last_request = time.monotonic()
+        if response.status_code != 200:
+            log.warning("GeckoTerminal HTTP %s", response.status_code)
+            return None
+        try:
+            return response.json()
+        except ValueError:
+            return None
+
 @asynccontextmanager
 async def mint_lock(key: str) -> AsyncIterator[None]:
+    """Per-key async lock; entries are removed when nobody is using them."""
     entry = _mint_locks.get(key)
     if entry is None:
         entry = _LockEntry()
@@ -370,11 +502,16 @@ def _trim_cache(cache: dict[str, tuple[Any, ...]], ttl: float) -> None:
 async def helius_rpc(method: str, params: Any) -> Any:
     if not HELIUS_KEY:
         return None
-    result = await request_json("POST", HELIUS_RPC_URL, params={"api-key": HELIUS_KEY}, json={"jsonrpc": "2.0", "id": "jabir-runner", "method": method, "params": params})
+    result = await request_json(
+        "POST", HELIUS_RPC_URL,
+        params={"api-key": HELIUS_KEY},
+        json={"jsonrpc": "2.0", "id": "jabir-runner", "method": method, "params": params},
+    )
     if result.get("error"):
         raise RuntimeError(str(result["error"]))
     return result.get("result")
 
+# ---- DexScreener token data ----
 def _cached_pair(mint: str) -> Optional[dict[str, Any]]:
     entry = _cache.get(mint)
     if entry and time.time() - entry[0] < CACHE_TTL:
@@ -386,7 +523,11 @@ def _recently_missing(mint: str) -> bool:
     return bool(entry and time.time() - entry[0] < NOT_FOUND_TTL)
 
 def _combine_pairs(matching: list[dict[str, Any]]) -> dict[str, Any]:
-    primary = max(matching, key=lambda p: (safe_num(nested(p, "volume", "h24")) or 0, safe_num(nested(p, "liquidity", "usd")) or 0))
+    primary = max(
+        matching,
+        key=lambda p: (safe_num(nested(p, "volume", "h24")) or 0,
+                       safe_num(nested(p, "liquidity", "usd")) or 0),
+    )
     combined = dict(primary)
     for field in ("liquidity", "volume"):
         vals = [safe_num(nested(p, field, "usd" if field == "liquidity" else "h24")) for p in matching]
@@ -397,12 +538,32 @@ def _combine_pairs(matching: list[dict[str, Any]]) -> dict[str, Any]:
     for period in ("h1", "h24"):
         buys = [safe_num(nested(p, "txns", period, "buys")) for p in matching]
         sells = [safe_num(nested(p, "txns", period, "sells")) for p in matching]
-        txns[period] = {"buys": sum(v for v in buys if v is not None) if any(v is not None for v in buys) else None, "sells": sum(v for v in sells if v is not None) if any(v is not None for v in sells) else None}
+        txns[period] = {
+            "buys": sum(v for v in buys if v is not None) if any(v is not None for v in buys) else None,
+            "sells": sum(v for v in sells if v is not None) if any(v is not None for v in sells) else None,
+        }
     combined["txns"] = txns
     if combined.get("marketCap") is None:
         combined["marketCap"] = next((p.get("marketCap") for p in matching if p.get("marketCap") is not None), None)
     if combined.get("fdv") is None:
         combined["fdv"] = next((p.get("fdv") for p in matching if p.get("fdv") is not None), None)
+    # Token age = oldest pair (a migrated pump.fun token keeps its launch time)
+    created = [safe_num(p.get("pairCreatedAt")) for p in matching]
+    created = [c for c in created if c]
+    if created:
+        combined["pairCreatedAt"] = min(created)
+    combined["_pools"] = sorted(
+        (
+            {
+                "address": p.get("pairAddress"),
+                "dex": p.get("dexId"),
+                "created": safe_num(p.get("pairCreatedAt")),
+                "vol": safe_num(nested(p, "volume", "h24")) or 0.0,
+            }
+            for p in matching if p.get("pairAddress")
+        ),
+        key=lambda x: x["vol"], reverse=True,
+    )
     combined["_pool_count"] = len(matching)
     return combined
 
@@ -412,27 +573,37 @@ async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
         return cached
     if _recently_missing(mint):
         return None
+
     async with mint_lock(f"pair:{mint}"):
+        # Recheck after getting the lock: another scan may have just filled the cache.
         cached = _cached_pair(mint)
         if cached is not None:
             return cached
         if _recently_missing(mint):
             return None
+
         payload = await dex_get_json(DEX_TOKEN_URL.format(mint))
         pairs = payload.get("pairs") if isinstance(payload, dict) else None
         if not isinstance(pairs, list):
             pairs = []
-        matching = [p for p in pairs if isinstance(p, dict) and p.get("chainId") == "solana" and str(nested(p, "baseToken", "address") or "").lower() == mint.lower()]
+        matching = [
+            p for p in pairs
+            if isinstance(p, dict)
+            and p.get("chainId") == "solana"
+            and str(nested(p, "baseToken", "address") or "").lower() == mint.lower()
+        ]
         if not matching:
             _trim_cache(_missing_cache, NOT_FOUND_TTL)
             _missing_cache[mint] = (time.time(), None)
             return None
+
         combined = _combine_pairs(matching)
         _trim_cache(_cache, CACHE_TTL)
         _cache[mint] = (time.time(), combined)
         _missing_cache.pop(mint, None)
         return combined
 
+# ---- DexScreener orders (DEX Paid / Ads) ----
 def _cached_paid(mint: str) -> Any:
     entry = _paid_cache.get(mint)
     if not entry:
@@ -440,28 +611,44 @@ def _cached_paid(mint: str) -> Any:
     ttl = PAID_CACHE_TTL if entry[1] is not None else PAID_FAIL_TTL
     return entry[1] if time.time() - entry[0] < ttl else _MISS
 
-async def fetch_paid_status(mint: str) -> Optional[bool]:
+def parse_orders(orders: Any) -> Optional[dict[str, bool]]:
+    """DexScreener orders: [{type: tokenProfile|communityTakeover|tokenAd|trendingBarAd, status: ...}]"""
+    if isinstance(orders, dict) and isinstance(orders.get("orders"), list):
+        orders = orders["orders"]
+    if not isinstance(orders, list):
+        return None
+    approved = [o for o in orders if isinstance(o, dict) and o.get("status") == "approved"]
+    return {
+        "paid": bool(approved),
+        "ads": any(o.get("type") in ("tokenAd", "trendingBarAd") for o in approved),
+    }
+
+async def fetch_paid_status(mint: str) -> Optional[dict[str, bool]]:
     cached = _cached_paid(mint)
     if cached is not _MISS:
         return cached
+
     async with mint_lock(f"paid:{mint}"):
         cached = _cached_paid(mint)
         if cached is not _MISS:
             return cached
-        result: Optional[bool] = None
+
+        result: Optional[dict[str, bool]] = None
         try:
+            # DEX Paid/Ads is optional: do not make the whole scan wait long for it
             orders = await dex_get_json(DEX_ORDERS_URL.format(mint), max_attempts=2, max_retry_after=8.0)
-            if isinstance(orders, dict) and isinstance(orders.get("orders"), list):
-                orders = orders["orders"]
-            if isinstance(orders, list):
-                result = any(isinstance(order, dict) and order.get("status") == "approved" for order in orders)
+            result = parse_orders(orders)
+            if result is None:
+                log.warning("Unexpected DexScreener orders response type %s for %s", type(orders).__name__, mint)
         except Exception as exc:
             log.warning("Dex paid status unavailable for %s: %s", mint, exc)
             result = None
+
         _trim_cache(_paid_cache, PAID_CACHE_TTL)
-        _paid_cache[mint] = (time.time(), result)
+        _paid_cache[mint] = (time.time(), result)  # failures (None) are cached only briefly
         return result
 
+# ---- Helius: supply, authorities ----
 async def fetch_supply(mint: str) -> Optional[dict[str, Any]]:
     result = await helius_rpc("getTokenSupply", [mint, {"commitment": "confirmed"}])
     value = (result or {}).get("value") or {}
@@ -476,7 +663,9 @@ async def fetch_supply(mint: str) -> Optional[dict[str, Any]]:
     return {"raw": raw_int, "decimals": decimals, "ui_amount": safe_num(value.get("uiAmount"))}
 
 async def fetch_authorities(mint: str) -> Optional[dict[str, Any]]:
-    result = await helius_rpc("getAccountInfo", [mint, {"encoding": "base64", "commitment": "confirmed"}])
+    result = await helius_rpc(
+        "getAccountInfo", [mint, {"encoding": "base64", "commitment": "confirmed"}]
+    )
     value = (result or {}).get("value")
     if not value:
         return None
@@ -489,15 +678,89 @@ async def fetch_authorities(mint: str) -> Optional[dict[str, Any]]:
         return None
     if len(raw) < 82:
         return None
+
     def authority(option_offset: int, key_offset: int) -> Optional[bool]:
         option = int.from_bytes(raw[option_offset:option_offset + 4], "little")
         return option == 1 if option in (0, 1) else None
+
     mint_active = authority(0, 4)
     freeze_active = authority(46, 50)
     if mint_active is None or freeze_active is None:
         return None
-    return {"mint_authority_active": mint_active, "freeze_authority_active": freeze_active, "token_program": value.get("owner"), "layout": "standard SPL"}
+    return {
+        "mint_authority_active": mint_active,
+        "freeze_authority_active": freeze_active,
+        "token_program": value.get("owner"),
+        "layout": "standard SPL",
+    }
 
+# ---- Helius: top holders (fast, runs on EVERY scan) ----
+async def fetch_top_accounts(mint: str) -> Optional[dict[str, Any]]:
+    """
+    Top 20 token accounts via getTokenLargestAccounts (1 call) + owners via
+    getMultipleAccounts (1 call). Fast even for tokens with millions of holders.
+    """
+    entry = _holders_cache.get(mint)
+    if entry and time.time() - entry[0] < HOLDERS_CACHE_TTL:
+        return entry[1]
+
+    async with mint_lock(f"top:{mint}"):
+        entry = _holders_cache.get(mint)
+        if entry and time.time() - entry[0] < HOLDERS_CACHE_TTL:
+            return entry[1]
+
+        result = await helius_rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
+        accounts = [a for a in ((result or {}).get("value") or []) if isinstance(a, dict) and a.get("address")]
+        data: Optional[dict[str, Any]] = None
+        if accounts:
+            info = await helius_rpc(
+                "getMultipleAccounts",
+                [[a["address"] for a in accounts], {"encoding": "jsonParsed", "commitment": "confirmed"}],
+            )
+            values = (info or {}).get("value") or []
+            owners: dict[str, int] = {}
+            for account, value in zip(accounts, values):
+                owner = nested(value, "data", "parsed", "info", "owner")
+                amount = safe_int(account.get("amount"))
+                if isinstance(owner, str) and amount:
+                    owners[owner] = owners.get(owner, 0) + amount
+            if owners:
+                data = {
+                    "entries": sorted(owners.items(), key=lambda kv: kv[1], reverse=True),
+                    "n_accounts": len(accounts),
+                }
+        _trim_cache(_holders_cache, HOLDERS_CACHE_TTL)
+        _holders_cache[mint] = (time.time(), data)
+        return data
+
+def summarize_top_holders(
+    top: Optional[dict[str, Any]], supply_raw: int, pool_addresses: set[str],
+) -> Optional[dict[str, Any]]:
+    """Split the top accounts into real wallets vs pool/program/burn holders."""
+    if not top or not top.get("entries") or supply_raw <= 0:
+        return None
+    wallets: list[tuple[str, float]] = []
+    excluded: list[tuple[str, float]] = []
+    for owner, amount in top["entries"]:
+        share = amount / supply_raw * 100
+        if owner in BURN_ADDRESSES or owner in pool_addresses or is_on_curve(owner) is False:
+            excluded.append((owner, share))
+        else:
+            wallets.append((owner, share))
+    top10 = wallets[:10]
+    all_shares = [share for _, share in wallets + excluded]
+    return {
+        "top10_percent": sum(s for _, s in top10) if top10 else None,
+        "top_count": len(top10),
+        "top_list": [s for _, s in wallets[:5]],
+        "excluded_count": len(excluded),
+        "excluded_percent": sum(s for _, s in excluded),
+        "wallet_share": dict(wallets),
+        "complete": top.get("n_accounts", 20) < 20,
+        "cutoff_percent": min(all_shares) if all_shares else None,
+    }
+
+# ---- Helius: full holder count (Deep Scan) ----
 async def fetch_holders(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
     if not HELIUS_KEY or supply_raw <= 0:
         return None
@@ -505,8 +768,12 @@ async def fetch_holders(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
     all_accounts: list[dict[str, Any]] = []
     reported_total = None
     complete = False
+
     for _ in range(MAX_HOLDER_PAGES):
-        params: dict[str, Any] = {"mint": mint, "limit": HOLDER_PAGE_SIZE, "options": {"showZeroBalance": False}}
+        params: dict[str, Any] = {
+            "mint": mint, "limit": HOLDER_PAGE_SIZE,
+            "options": {"showZeroBalance": False},
+        }
         if cursor:
             params["cursor"] = cursor
         result = await helius_rpc("getTokenAccounts", params)
@@ -521,68 +788,354 @@ async def fetch_holders(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
             complete = True
             break
         cursor = next_cursor
+
     if not all_accounts:
         return None
+
     owner_amounts: dict[str, int] = {}
     for account in all_accounts:
         owner = account.get("owner")
         amount = safe_int(account.get("amount"))
         if owner and amount is not None and amount > 0:
             owner_amounts[owner] = owner_amounts.get(owner, 0) + amount
-    ranked = sorted(owner_amounts.items(), key=lambda item: item[1], reverse=True)
+
     if reported_total is not None:
         complete = complete and len(all_accounts) >= reported_total
-    top10 = (sum(amount for _, amount in ranked[:10]) / supply_raw * 100) if complete else None
-    top_five = [f"{amount / supply_raw * 100:.1f}%" for _, amount in ranked[:5]] if complete else []
-    return {"holder_count": len(owner_amounts) if complete else None, "top10_percent": top10, "top_five": top_five, "complete": complete, "accounts_scanned": len(all_accounts), "reported_accounts": reported_total}
+    return {
+        "holder_count": len(owner_amounts) if complete else None,
+        "complete": complete,
+        "accounts_scanned": len(all_accounts),
+        "reported_accounts": reported_total,
+    }
+
+# ---- Helius: launch analysis - bundles / snipers / dev (ESTIMATE, Deep Scan only) ----
+def _fee_payer(tx: dict[str, Any]) -> Optional[str]:
+    keys = nested(tx, "transaction", "message", "accountKeys")
+    if isinstance(keys, list) and keys:
+        first = keys[0]
+        if isinstance(first, dict):
+            return first.get("pubkey")
+        if isinstance(first, str):
+            return first
+    return None
+
+def _token_deltas(tx: dict[str, Any], mint: str) -> dict[str, int]:
+    """Per-owner change in this token's balance inside one transaction."""
+    meta = (tx or {}).get("meta") or {}
+    pre: dict[str, int] = {}
+    post: dict[str, int] = {}
+    for source, target in ((meta.get("preTokenBalances"), pre), (meta.get("postTokenBalances"), post)):
+        for balance in source or []:
+            if not isinstance(balance, dict) or balance.get("mint") != mint or not balance.get("owner"):
+                continue
+            amount = safe_int(nested(balance, "uiTokenAmount", "amount")) or 0
+            target[balance["owner"]] = target.get(balance["owner"], 0) + amount
+    return {owner: post.get(owner, 0) - pre.get(owner, 0) for owner in set(pre) | set(post)}
+
+def analyze_launch(txs: list[dict[str, Any]], mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
+    """
+    txs: parsed transactions, OLDEST FIRST. Estimates:
+    - creator: fee payer of the earliest successful transaction
+    - bundle: other real wallets that received the token in the launch slot
+    - snipers: other real wallets that received it within SNIPER_SLOTS slots after launch
+    Amounts are what they RECEIVED, not what they still hold.
+    """
+    parsed = [t for t in txs if isinstance(t, dict) and safe_int(t.get("slot")) is not None]
+    if not parsed or supply_raw <= 0:
+        return None
+    launch_slot = safe_int(parsed[0]["slot"])
+    covered_slot = safe_int(parsed[-1]["slot"])
+    creator = _fee_payer(parsed[0])
+
+    bundle: dict[str, int] = {}
+    snipers: dict[str, int] = {}
+    creator_buy = 0
+    for tx in parsed:
+        slot = safe_int(tx["slot"])
+        if slot is None or slot > launch_slot + SNIPER_SLOTS:
+            continue
+        for owner, delta in _token_deltas(tx, mint).items():
+            if delta <= 0 or owner in BURN_ADDRESSES or is_on_curve(owner) is False:
+                continue
+            if owner == creator:
+                if slot == launch_slot:
+                    creator_buy += delta
+                continue
+            if slot == launch_slot:
+                bundle[owner] = bundle.get(owner, 0) + delta
+            elif owner not in bundle:
+                snipers[owner] = snipers.get(owner, 0) + delta
+
+    def share(amounts: dict[str, int]) -> float:
+        return sum(amounts.values()) / supply_raw * 100
+
+    return {
+        "creator": creator,
+        "launch_slot": launch_slot,
+        "bundle_count": len(bundle),
+        "bundle_percent": share(bundle),
+        "sniper_count": len(snipers),
+        "sniper_percent": share(snipers),
+        "creator_buy_percent": creator_buy / supply_raw * 100,
+        "slots_covered": (covered_slot - launch_slot) if covered_slot is not None else 0,
+        "sample_size": len(parsed),
+    }
+
+async def fetch_launch_buyers(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
+    """Find the oldest transactions of the mint (only possible when the token has <= ~6,000 txs)."""
+    signatures: list[dict[str, Any]] = []
+    before = None
+    reached_start = False
+    for _ in range(LAUNCH_SIG_PAGES):
+        options: dict[str, Any] = {"limit": 1000, "commitment": "confirmed"}
+        if before:
+            options["before"] = before
+        page = await helius_rpc("getSignaturesForAddress", [mint, options])
+        if not isinstance(page, list) or not page:
+            reached_start = bool(signatures)
+            break
+        signatures.extend(s for s in page if isinstance(s, dict) and s.get("signature"))
+        if len(page) < 1000:
+            reached_start = True
+            break
+        before = page[-1].get("signature")
+    if not reached_start or not signatures:
+        return None
+
+    # pages come newest -> oldest; reverse to get oldest first
+    oldest_first = [s for s in reversed(signatures) if not s.get("err")][:LAUNCH_TX_SAMPLE]
+    if not oldest_first:
+        return None
+
+    limiter = asyncio.Semaphore(8)
+
+    async def load(signature: str) -> Optional[dict[str, Any]]:
+        async with limiter:
+            return await helius_rpc(
+                "getTransaction",
+                [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}],
+            )
+
+    results = await asyncio.gather(*(load(s["signature"]) for s in oldest_first), return_exceptions=True)
+    # gather keeps the input order, so the loaded transactions stay oldest first
+    txs = [r for r in results if isinstance(r, dict)]
+    return analyze_launch(txs, mint, supply_raw)
+
+# ---- GeckoTerminal: real ATH ----
+async def fetch_ath(
+    mint: str, pools: list[dict[str, Any]], age_sec: Optional[float], price: Optional[float],
+) -> Optional[dict[str, Any]]:
+    """Highest price seen in the pool candles (primary pool + oldest pool)."""
+    if not pools or not price or price <= 0:
+        return None
+    entry = _ath_cache.get(mint)
+    if entry:
+        ttl = ATH_CACHE_TTL if entry[1] is not None else ATH_FAIL_TTL
+        if time.time() - entry[0] < ttl:
+            return entry[1]
+
+    async with mint_lock(f"ath:{mint}"):
+        entry = _ath_cache.get(mint)
+        if entry:
+            ttl = ATH_CACHE_TTL if entry[1] is not None else ATH_FAIL_TTL
+            if time.time() - entry[0] < ttl:
+                return entry[1]
+
+        chosen = [pools[0]]
+        dated = [p for p in pools if p.get("created")]
+        if dated:
+            oldest = min(dated, key=lambda p: p["created"])
+            if oldest["address"] != pools[0]["address"]:
+                chosen.append(oldest)
+
+        use_hours = age_sec is not None and age_sec <= 40 * 86400
+        timeframe, limit = ("hour", 1000) if use_hours else ("day", 180)
+
+        async def one(pool: dict[str, Any]) -> Optional[tuple[float, float]]:
+            payload = await gecko_get_json(
+                GECKO_OHLCV_URL.format(pool=pool["address"], timeframe=timeframe),
+                {"aggregate": 1, "limit": limit, "currency": "usd", "token": "base"},
+            )
+            candles = nested(payload, "data", "attributes", "ohlcv_list")
+            if not isinstance(candles, list):
+                return None
+            rows = []
+            for candle in candles:
+                if isinstance(candle, list) and len(candle) >= 5:
+                    ts, high, close = safe_num(candle[0]), safe_num(candle[2]), safe_num(candle[4])
+                    if ts and high and high > 0:
+                        rows.append((ts, high, close))
+            if not rows:
+                return None
+            newest = max(rows, key=lambda r: r[0])
+            if newest[2] and not (0.2 <= newest[2] / price <= 5):
+                return None  # candle prices do not match this token (wrong side of the pair)
+            best = max(rows, key=lambda r: r[1])
+            return best[0], best[1]
+
+        found = [r for r in await asyncio.gather(*(one(p) for p in chosen), return_exceptions=True)
+                 if isinstance(r, tuple)]
+        result = None
+        if found:
+            ts, high = max(found, key=lambda r: r[1])
+            result = {
+                "price": max(high, price), "ts": ts if high >= price else time.time(),
+                "limited_window": (not use_hours) and age_sec is not None and age_sec > 180 * 86400,
+            }
+        _trim_cache(_ath_cache, ATH_CACHE_TTL)
+        _ath_cache[mint] = (time.time(), result)
+        return result
 
 def socials_from_pair(pair: dict[str, Any]) -> dict[str, bool]:
     info = pair.get("info") or {}
     websites = [x for x in (info.get("websites") or []) if isinstance(x, dict) and x.get("url")]
     socials = [x for x in (info.get("socials") or []) if isinstance(x, dict)]
-    values = [" ".join(str(x.get(k, "")) for k in ("type", "platform", "url", "handle")).lower() for x in socials]
-    return {"x": any("twitter" in x or "x.com" in x for x in values), "web": bool(websites), "tg": any("telegram" in x or "t.me" in x for x in values)}
+    values = [
+        " ".join(str(x.get(k, "")) for k in ("type", "platform", "url", "handle")).lower()
+        for x in socials
+    ]
+    return {
+        "x": any("twitter" in x or "x.com" in x for x in values),
+        "web": bool(websites),
+        "tg": any("telegram" in x or "t.me" in x for x in values),
+    }
 
 async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
-    pair = await fetch_pair(mint)
+    """Everything runs in parallel: DexScreener, Helius and GeckoTerminal do not wait for each other."""
+
+    async def pair_and_ath() -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+        pair = await fetch_pair(mint)
+        if not pair:
+            return None, None
+        created = safe_num(pair.get("pairCreatedAt"))
+        age = time.time() - created / 1000 if created else None
+        ath = None
+        try:
+            ath = await asyncio.wait_for(
+                fetch_ath(mint, pair.get("_pools") or [], age, safe_num(pair.get("priceUsd"))),
+                ATH_TIMEOUT,
+            )
+        except Exception as exc:
+            log.warning("ATH lookup failed: %s", type(exc).__name__)
+        return pair, ath
+
+    async def helius_chain() -> dict[str, Any]:
+        if not HELIUS_KEY:
+            return {}
+        supply = await fetch_supply(mint)
+        out: dict[str, Any] = {"supply": supply}
+        if not supply:
+            return out
+        jobs: dict[str, Any] = {"top": fetch_top_accounts(mint)}
+        if deep:
+            jobs["holders"] = fetch_holders(mint, supply["raw"])
+            jobs["launch"] = asyncio.wait_for(fetch_launch_buyers(mint, supply["raw"]), LAUNCH_TIMEOUT)
+        results = await asyncio.gather(*jobs.values(), return_exceptions=True)
+        for key, value in zip(jobs, results):
+            if isinstance(value, Exception):
+                log.warning("%s lookup failed: %s", key, _scrub(str(value)) or type(value).__name__)
+                value = None
+            out[key] = value
+        return out
+
+    authority_task = fetch_authorities(mint) if HELIUS_KEY else asyncio.sleep(0, result=None)
+    pair_res, paid_res, helius_res, authorities = await asyncio.gather(
+        pair_and_ath(), fetch_paid_status(mint), helius_chain(), authority_task,
+        return_exceptions=True,
+    )
+    if isinstance(pair_res, Exception):
+        raise pair_res
+    pair, ath_info = pair_res
     if not pair:
-        raise ValueError("Ba a samu Solana pair da mint ɗin yake base token ba.")
+        raise ValueError("No Solana pair found for this token address.")
+    for label, value in (("paid", paid_res), ("helius", helius_res), ("authorities", authorities)):
+        if isinstance(value, Exception):
+            log.warning("%s lookup failed: %s", label, _scrub(str(value)) or type(value).__name__)
+    paid = None if isinstance(paid_res, Exception) else paid_res
+    helius = {} if isinstance(helius_res, Exception) else helius_res
+    if isinstance(authorities, Exception):
+        authorities = None
+
     base = pair.get("baseToken") or {}
     volume, changes = pair.get("volume") or {}, pair.get("priceChange") or {}
     txns = pair.get("txns") or {}
     h1, h24 = txns.get("h1") or {}, txns.get("h24") or {}
+
     price = safe_num(pair.get("priceUsd"))
     fdv, mc = safe_num(pair.get("fdv")), safe_num(pair.get("marketCap"))
     liq = safe_num(nested(pair, "liquidity", "usd"))
     created_ms = safe_num(pair.get("pairCreatedAt"))
     created_ts = created_ms / 1000 if created_ms else None
     age_sec = time.time() - created_ts if created_ts else None
+
     await asyncio.to_thread(record_snapshot, mint, price, fdv, mc)
     tracking = await asyncio.to_thread(tracking_data, mint)
-    old = tracking.get("old_24h")
-    fdv_change_24h = None
-    if old and old[1] and fdv is not None and old[1] > 0:
-        fdv_change_24h = (fdv / old[1] - 1) * 100
-    paid_task = fetch_paid_status(mint)
-    supply_task = fetch_supply(mint) if HELIUS_KEY else asyncio.sleep(0, result=None)
-    authority_task = fetch_authorities(mint) if HELIUS_KEY else asyncio.sleep(0, result=None)
-    paid, supply, authorities = await asyncio.gather(paid_task, supply_task, authority_task, return_exceptions=True)
-    for label, value in (("paid", paid), ("supply", supply), ("authorities", authorities)):
-        if isinstance(value, Exception):
-            log.warning("%s lookup failed: %s", label, value)
-    if isinstance(paid, Exception): paid = None
-    if isinstance(supply, Exception): supply = None
-    if isinstance(authorities, Exception): authorities = None
-    holders = None
-    if deep and supply:
-        try:
-            holders = await fetch_holders(mint, supply["raw"])
-        except Exception as exc:
-            log.warning("Holder lookup failed: %s", exc)
     first = tracking.get("first")
-    ath_price = tracking.get("ath_price")
-    ath_distance = ((price / ath_price) - 1) * 100 if price is not None and ath_price and ath_price > 0 else None
-    return {"mint": mint, "name": base.get("name") or "Unknown", "symbol": base.get("symbol") or "?", "price": price, "liquidity": liq, "volume24": safe_num(volume.get("h24")), "fdv": fdv, "mc": mc, "price_change_1h": safe_num(changes.get("h1")), "price_change_24h": safe_num(changes.get("h24")), "buys1h": safe_int(h1.get("buys")), "sells1h": safe_int(h1.get("sells")), "buys24": safe_int(h24.get("buys")), "sells24": safe_int(h24.get("sells")), "dex": pair.get("dexId") or "N/A", "pair": pair.get("pairAddress"), "url": pair.get("url") or f"https://dexscreener.com/solana/{mint}", "created_ts": created_ts, "age_sec": age_sec, "ath_price": ath_price, "ath_distance": ath_distance, "fdv_change_24h": fdv_change_24h, "supply": supply, "authorities": authorities, "holders": holders, "socials": socials_from_pair(pair), "dex_paid": paid, "first_seen": first[0] if first else None, "first_price": first[1] if first else None, "first_mc": first[2] if first else None, "pair_data": pair, "pool_count": pair.get("_pool_count", 1)}
+    now = time.time()
+
+    since_first = None
+    if first and first[1] and price is not None and first[1] > 0 and now - first[0] >= 300:
+        since_first = (price / first[1] - 1) * 100
+
+    # ATH: real chart data first, bot-tracked data as fallback
+    mc_ref = mc if mc is not None else fdv
+    mc_per_price = (mc_ref / price) if (mc_ref and price) else None
+    ath: Optional[dict[str, Any]] = None
+    if ath_info and price:
+        ath = {
+            "price": ath_info["price"], "ts": ath_info["ts"], "source": "chart",
+            "limited_window": ath_info.get("limited_window", False),
+        }
+    elif first and now - first[0] >= 600 and tracking.get("ath_price"):
+        ath = {"price": tracking["ath_price"], "ts": None, "source": "tracked", "limited_window": False}
+    if ath and price:
+        ath["distance"] = (price / ath["price"] - 1) * 100 if ath["price"] > 0 else None
+        ath["mc"] = ath["price"] * mc_per_price if mc_per_price else None
+
+    supply = helius.get("supply")
+    pools = pair.get("_pools") or []
+    pool_set = {p["address"] for p in pools if p.get("address")}
+    pool_set.add(pair.get("pairAddress") or "")
+    top_holders = None
+    if supply and helius.get("top"):
+        top_holders = summarize_top_holders(helius["top"], supply["raw"], pool_set)
+
+    launch = helius.get("launch")
+    dev = None
+    if launch and launch.get("creator"):
+        creator = launch["creator"]
+        share = (top_holders or {}).get("wallet_share", {}).get(creator)
+        dev = {
+            "wallet": creator,
+            "percent": share,
+            "outside_top": share is None and top_holders is not None,
+            "cutoff": (top_holders or {}).get("cutoff_percent"),
+            "complete": bool((top_holders or {}).get("complete")),
+        }
+
+    return {
+        "mint": mint, "name": base.get("name") or "Unknown", "symbol": base.get("symbol") or "?",
+        "price": price, "liquidity": liq, "volume24": safe_num(volume.get("h24")),
+        "fdv": fdv, "mc": mc,
+        "price_change_5m": safe_num(changes.get("m5")),
+        "price_change_1h": safe_num(changes.get("h1")),
+        "price_change_6h": safe_num(changes.get("h6")),
+        "price_change_24h": safe_num(changes.get("h24")),
+        "buys1h": safe_int(h1.get("buys")), "sells1h": safe_int(h1.get("sells")),
+        "buys24": safe_int(h24.get("buys")), "sells24": safe_int(h24.get("sells")),
+        "dex": pair.get("dexId") or "N/A", "pair": pair.get("pairAddress"),
+        "url": pair.get("url") or f"https://dexscreener.com/solana/{mint}",
+        "created_ts": created_ts, "age_sec": age_sec,
+        "ath": ath, "since_first": since_first, "scans": tracking.get("scans"),
+        "supply": supply, "authorities": authorities,
+        "top_holders": top_holders, "holders": helius.get("holders"),
+        "launch": launch, "dev": dev, "deep": deep,
+        "socials": socials_from_pair(pair),
+        "dex_paid": paid.get("paid") if paid else None,
+        "dex_ads": paid.get("ads") if paid else None,
+        "first_seen": first[0] if first else None,
+        "pair_data": pair, "pool_count": pair.get("_pool_count", 1),
+    }
 
 # ------------------------------ RISK / NARRATIVE -----------------------------
 def buy_ratio(data: dict[str, Any]) -> Optional[float]:
@@ -592,167 +1145,319 @@ def buy_ratio(data: dict[str, Any]) -> Optional[float]:
     return buys / (buys + sells)
 
 def market_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
-    flags = []
+    flags: list[tuple[str, str]] = []
     liq, vol = data.get("liquidity"), data.get("volume24")
     mc = data.get("mc") or data.get("fdv")
     age = data.get("age_sec")
     if liq is not None and liq < 10_000:
         flags.append(("HIGH", "Liquidity below $10K"))
+    # LP/MC check only for small/mid caps ($100K - $50M); large caps normally have low ratios
     if liq is not None and mc and 100_000 <= mc <= 50_000_000 and liq / mc < 0.02:
         flags.append(("HIGH", f"LP/MC very thin ({liq / mc * 100:.1f}%)"))
     elif liq is not None and mc and 100_000 <= mc <= 50_000_000 and liq / mc < 0.05:
         flags.append(("MEDIUM", f"LP/MC thin ({liq / mc * 100:.1f}%)"))
     if age is not None and age < 3600:
-        flags.append(("MEDIUM", "Pair younger than 1 hour"))
+        flags.append(("MEDIUM", "Token is less than 1 hour old"))
     if vol is not None and mc and vol > mc * 5:
-        flags.append(("MEDIUM", "24h volume exceeds 5x MC; verify wash-trading risk"))
+        flags.append(("MEDIUM", "24h volume is over 5x MC (possible wash trading)"))
     if vol is not None and data.get("fdv") and data["fdv"] > 0 and vol < data["fdv"] * 0.01:
-        flags.append(("MEDIUM", "Volume is thin versus FDV"))
+        flags.append(("MEDIUM", "Very low volume compared to FDV"))
     ratio = buy_ratio(data)
     tx_total = (data.get("buys24") or 0) + (data.get("sells24") or 0)
     if ratio is not None and tx_total >= 100 and ratio < 0.40:
-        flags.append(("MEDIUM", "Heavy sell pressure"))
+        flags.append(("MEDIUM", "Heavy selling (under 40% buys)"))
     return flags
 
-def security_assessment(data: dict[str, Any]) -> dict[str, Any]:
+def all_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
+    """Market + on-chain + holder + launch flags. HIGH flags first."""
+    flags = market_flags(data)
     authorities = data.get("authorities") or {}
-    holders = data.get("holders") or {}
-    flags = []
     if authorities.get("mint_authority_active") is True:
-        flags.append("Mint authority active")
+        flags.append(("HIGH", "Mint authority is active (more supply can be created)"))
     if authorities.get("freeze_authority_active") is True:
-        flags.append("Freeze authority active")
-    top10 = holders.get("top10_percent")
-    if top10 is not None and top10 >= 50:
-        flags.append(f"Top 10 wallets hold {top10:.1f}%")
-        top_five = holders.get("top_five") or []
-        top_one = safe_num(str(top_five[0]).rstrip("%")) if top_five else None
-        if top_one is not None and top_one >= 50:
-            flags.append(f"Top wallet holds {top_one:.1f}% (may be bonding curve/pool, not verified)")
-    if flags:
-        level = "HIGH"
-    elif not authorities:
-        level = "UNKNOWN"
-    elif data.get("holders") is None:
-        level = "PARTIAL"
-    else:
-        level = "CHECKED" if holders.get("complete") else "PARTIAL"
-    return {"level": level, "flags": flags}
+        flags.append(("HIGH", "Freeze authority is active (wallets can be frozen)"))
+
+    top = data.get("top_holders") or {}
+    top_list = top.get("top_list") or []
+    if top_list and top_list[0] >= 20:
+        flags.append(("HIGH", f"One wallet holds {top_list[0]:.1f}% of supply"))
+    top10 = top.get("top10_percent")
+    if top10 is not None:
+        if top10 >= 50:
+            flags.append(("HIGH", f"Top 10 wallets hold {top10:.1f}%"))
+        elif top10 >= 30:
+            flags.append(("MEDIUM", f"Top 10 wallets hold {top10:.1f}%"))
+
+    launch = data.get("launch") or {}
+    if launch.get("bundle_percent", 0) >= 10:
+        flags.append(("MEDIUM", f"Launch bundle got about {launch['bundle_percent']:.1f}% (estimate)"))
+    if launch.get("sniper_percent", 0) >= 10:
+        flags.append(("MEDIUM", f"Snipers got about {launch['sniper_percent']:.1f}% (estimate)"))
+    dev = data.get("dev") or {}
+    if dev.get("percent") is not None and dev["percent"] >= 10:
+        flags.append(("MEDIUM", f"Dev wallet (likely) holds {dev['percent']:.1f}%"))
+
+    return sorted(flags, key=lambda f: 0 if f[0] == "HIGH" else 1)
 
 def verdict(data: dict[str, Any]) -> tuple[str, str]:
     liq, vol = data.get("liquidity"), data.get("volume24")
     mc = data.get("mc") or data.get("fdv")
     chg, age = data.get("price_change_24h"), data.get("age_sec")
-    flags = market_flags(data)
-    security = security_assessment(data)
+    flags = all_flags(data)
     if liq is not None and mc is not None and liq < 10_000 and mc > 100_000:
-        return "🔴 AVOID", "Low liquidity relative to valuation"
+        return "🔴 AVOID", "Liquidity is too low for this market cap"
     if age is not None and age >= 3600 and mc is not None and mc < 5_000 and (vol is None or vol < 1_000):
-        return "🔴 AVOID", f"Dead/illiquid: MC {money(mc)}, 24h vol {money(vol)}"
-    high_texts = [text for level, text in flags if level == "HIGH"]
-    if security["level"] == "HIGH":
-        high_texts += security["flags"]
-    if high_texts:
-        return "🟡 WATCH", "High risk: " + high_texts[0]
+        return "🔴 AVOID", f"Dead token: MC {money(mc)}, 24h volume {money(vol)}"
+    high = [text for level, text in flags if level == "HIGH"]
+    if high:
+        return "🟡 WATCH", "High risk: " + high[0]
     if age is not None and age < 3600 and vol is not None and mc and vol > mc * 2:
-        return "🟡 WATCH", "Very new pair with unusually high volume"
+        return "🟡 WATCH", "Very new token with unusually high volume"
     if chg is not None and chg > 100 and liq is not None and vol is not None and vol > liq:
-        return "🟡 WATCH", "Potentially overheated; wait for confirmation"
+        return "🟡 WATCH", "Price is overheated. Wait for a pullback or confirmation"
     ratio = buy_ratio(data)
-    if chg is not None and chg > 0 and ratio is not None and ratio >= 0.55 and liq is not None and liq >= 25_000 and age is not None and age >= 3600:
-        return "🟢 BUY", f"Up {chg:.1f}%, {ratio*100:.0f}% buys, LP {money(liq)}"
-    return "🟡 WATCH", "Babu momentum confirmation. Jira."
+    if (chg is not None and chg > 0 and ratio is not None and ratio >= 0.55
+            and liq is not None and liq >= 25_000 and age is not None and age >= 3600):
+        return "🟢 BUY", f"Up {chg:.1f}% in 24h, {ratio * 100:.0f}% buys, liquidity {money(liq)}"
+    return "🟡 WATCH", "No clear momentum yet"
 
-# --- CLEAN NARRATIVE: 1 line, no quotes ---
+def fallback_narrative(data: dict[str, Any]) -> str:
+    """Rule-based one-liner used when the AI is slow or unavailable."""
+    socials = data.get("socials") or {}
+    links = [label for label, ok in (("X", socials.get("x")), ("website", socials.get("web")), ("Telegram", socials.get("tg"))) if ok]
+    links_text = "has " + ", ".join(links) + " links" if links else "has no social links listed"
+    return (
+        f"{data['name']} trades on {data['dex']}, is {age_text(data['age_sec'])} old and {links_text}. "
+        f"Project identity is unverified."
+    )
+
 async def groq_narrative(data: dict[str, Any]) -> str:
+    cached = _narrative_cache.get(data["mint"])
+    if cached and time.time() - cached[0] < NARRATIVE_CACHE_TTL:
+        return cached[1]
     if not GROQ_KEY:
-        return "Narrative ba a samu ba."
-    prompt_data = {"name": data["name"], "ticker": data["symbol"], "dex": data["dex"], "pair_age": age_text(data["age_sec"]), "price_change_1h": data["price_change_1h"], "price_change_24h": data["price_change_24h"], "liquidity_usd": data["liquidity"], "volume_24h_usd": data["volume24"], "social_links_present": data["socials"]}
-    prompt = ("Write EXACTLY ONE line in natural Hausa, max 25 words. Describe only what name, symbol, dex, age, price change, liquidity, volume and social links support. Say identity / social authenticity is unverified. Do not invent utility, team, news, partnerships, community or adoption. Do not advise buying/selling. No quotes, no bullet, no intro. Data: " + json.dumps(prompt_data, ensure_ascii=False))
+        return fallback_narrative(data)
+
+    prompt_data = {
+        "name": data["name"], "ticker": data["symbol"], "dex": data["dex"],
+        "token_age": age_text(data["age_sec"]),
+        "price_change_1h": data["price_change_1h"],
+        "price_change_24h": data["price_change_24h"],
+        "liquidity_usd": data["liquidity"], "volume_24h_usd": data["volume24"],
+        "social_links_present": data["socials"],
+    }
+    prompt = (
+        "Write ONE short line in simple English (max 20 words) about this token for a trader. "
+        "Use only the data given. Say that the project identity is unverified. "
+        "Do not invent utility, team, news, partnerships, community or adoption. "
+        "Do not advise buying or selling. No quotes, no bullets, no intro. "
+        "Data: " + json.dumps(prompt_data, ensure_ascii=False)
+    )
     try:
-        payload: dict[str, Any] = {"model": GROQ_MODEL, "messages": [{"role": "system", "content": "Return only one Hausa line, max 25 words. No quotes."}, {"role": "user", "content": prompt}], "temperature": 0.2, "max_tokens": 800}
+        payload: dict[str, Any] = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": "Return exactly one short line of simple English. No quotes."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 800,  # gpt-oss thinks first; thinking tokens count toward this limit
+        }
         if "gpt-oss" in GROQ_MODEL.lower():
             payload["reasoning_effort"] = "low"
-        result = await request_json("POST", GROQ_URL, headers={"Authorization": f"Bearer {GROQ_KEY}"}, json=payload)
+        result = await asyncio.wait_for(
+            request_json("POST", GROQ_URL, headers={"Authorization": f"Bearer {GROQ_KEY}"}, json=payload),
+            NARRATIVE_TIMEOUT,
+        )
         content = (result["choices"][0]["message"].get("content") or "").strip()
         content = content.replace('"', "").replace("'", "").strip()
-        lines = [l.strip() for l in content.splitlines() if l.strip()]
-        if not lines:
-            return "Narrative ba a samu ba."
-        return lines[0]
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        text = lines[0] if lines else fallback_narrative(data)
     except Exception as exc:
-        log.warning("Groq narrative failed: %s", exc)
-        return "Narrative ba a samu ba."
+        log.warning("Groq narrative skipped: %s", _scrub(str(exc)) or type(exc).__name__)
+        text = fallback_narrative(data)
+    _trim_cache(_narrative_cache, NARRATIVE_CACHE_TTL)
+    _narrative_cache[data["mint"]] = (time.time(), text)
+    return text
 
-# ------------------------------ REPORT / UI - CLEAN --------------------------
+# ------------------------------ REPORT / UI ----------------------------------
 def yes_no(value: Optional[bool]) -> str:
     return "✅" if value is True else "❌" if value is False else "N/A"
 
 def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
     verdict_text, verdict_reason = verdict(data)
-    market = market_flags(data)
-    supply, holders = data.get("supply") or {}, data.get("holders") or {}
+    flags = all_flags(data)
     authorities = data.get("authorities") or {}
-    mc_value = data.get("mc")
-    mc_text = money(mc_value) if mc_value is not None else (f"N/A (FDV {money(data.get('fdv'))})" if data.get("fdv") is not None else "N/A")
-    mint_auth = "REVOKED" if authorities.get("mint_authority_active") is False else ("ACTIVE" if authorities.get("mint_authority_active") is True else "—")
-    freeze_auth = "REVOKED" if authorities.get("freeze_authority_active") is False else ("ACTIVE" if authorities.get("freeze_authority_active") is True else "—")
-    if holders.get("holder_count") is not None:
-        holder_line = f"{fmt_count(holders.get('holder_count'))}"
-        if holders.get("top10_percent") is not None:
-            holder_line += f" | Top 10: {holders['top10_percent']:.1f}%"
-    elif deep:
-        holder_line = "Deep Scan bai cika ba"
+    top = data.get("top_holders") or {}
+    holders = data.get("holders") or {}
+    launch = data.get("launch") or {}
+    dev = data.get("dev") or {}
+    socials = data.get("socials") or {}
+
+    mc_text = money(data.get("mc")) if data.get("mc") is not None else (
+        f"N/A (FDV {money(data.get('fdv'))})" if data.get("fdv") is not None else "N/A"
+    )
+
+    # ATH
+    ath = data.get("ath")
+    if ath and ath.get("mc") is not None and ath.get("distance") is not None:
+        when = ""
+        if ath.get("ts"):
+            when = f" · {age_text(time.time() - ath['ts'])} ago"
+        elif ath.get("source") == "tracked":
+            when = " · tracked"
+        window = " (6m)" if ath.get("limited_window") else ""
+        ath_line = f"🏔 ATH MC {money(ath['mc'])}{window} ({ath['distance']:+.0f}%){when}"
     else:
-        holder_line = "Danna Deep Scan"
-    pair = data.get("pair") or data["mint"]
-    chart_url = f"https://dexscreener.com/solana/{pair}"
-    photon_url = f"https://photon-sol.tinyastro.io/en/lp/{pair}"
-    solscan_url = f"https://solscan.io/token/{data['mint']}"
-    dex_url = data.get("url") or chart_url
-    risk_text = "; ".join(t for _, t in market[:2]) if market else "Babu flag"
+        ath_line = "🏔 ATH: N/A"
+
+    # Since first scan / scans
+    track_bits = []
+    if data.get("since_first") is not None and data.get("first_seen"):
+        track_bits.append(f"Since 1st scan {data['since_first']:+.1f}% ({age_text(time.time() - data['first_seen'])} ago)")
+    if data.get("scans"):
+        track_bits.append(f"Scans: {data['scans']}")
+    track_line = "📈 " + " | ".join(track_bits) if track_bits else ""
+
+    # Mint / freeze
+    def authority_text(key: str) -> str:
+        if not authorities:
+            return "N/A"
+        return "ACTIVE ⚠️" if authorities.get(key) is True else "revoked ✅"
+
+    # Holders
+    if top.get("top10_percent") is not None:
+        label = "Top 10" if top.get("top_count", 0) >= 10 else f"Top {top.get('top_count')}"
+        holders_line = f"👥 {label}: {top['top10_percent']:.1f}%"
+        if top.get("excluded_count"):
+            holders_line += f" (excl. {top['excluded_count']} pool/program wallets)"
+        if top.get("top_list"):
+            holders_line += "\n    " + " | ".join(f"{s:.1f}%" for s in top["top_list"])
+    elif data.get("supply") is None and not HELIUS_KEY:
+        holders_line = "👥 Holders: N/A (Helius key missing)"
+    else:
+        holders_line = "👥 Top holders: N/A"
+    if holders.get("holder_count") is not None:
+        holders_line += f"\n    Total holders: {fmt_count(holders['holder_count'])}"
+    elif holders.get("accounts_scanned") and not holders.get("complete"):
+        holders_line += f"\n    Total holders: {fmt_count(holders['accounts_scanned'])}+ (scan limit)"
+
+    # Launch (Deep Scan)
+    if launch:
+        extra = [
+            f"📦 Bundle (est.): {launch['bundle_count']} wallets in launch block "
+            f"({launch['bundle_percent']:.1f}% of supply)",
+            f"🎯 Snipers (est.): {launch['sniper_count']} wallets "
+            f"({launch['sniper_percent']:.1f}% of supply)",
+        ]
+        if dev.get("wallet"):
+            if dev.get("percent") is not None:
+                dev_text = f"holds {dev['percent']:.1f}%"
+            elif dev.get("outside_top") and dev.get("complete"):
+                dev_text = "holds 0% (not in holder list)"
+            elif dev.get("outside_top") and dev.get("cutoff") is not None:
+                dev_text = f"holds under {dev['cutoff']:.1f}% (outside top 20)"
+            else:
+                dev_text = "holding unknown"
+            extra.append(f"🛠 Dev (likely) {esc(short_addr(dev['wallet']))} {dev_text}")
+        launch_block = "\n".join(extra)
+    elif deep:
+        launch_block = "📦 Bundles/snipers/dev: N/A (token has too many transactions or data unavailable)"
+    else:
+        launch_block = "📦 Bundles/snipers/dev: tap Deep Scan"
+
+    # Risk
+    if flags:
+        level = "🔴" if any(l == "HIGH" for l, _ in flags) else "🟡"
+        risk_text = f"{level} " + "; ".join(t for _, t in flags[:3])
+    else:
+        risk_text = "🟢 No flags found in available data"
+
+    social_line = (
+        f"🔗 X {yes_no(socials.get('x'))} • Web {yes_no(socials.get('web'))} • TG {yes_no(socials.get('tg'))}"
+    )
+
     lines = [
         f"🚀 <b>JABIR RUNNER V3</b> | ${esc(data['symbol'])}",
         BAR,
         f"🪙 {esc(data['name'])} | {esc(data['dex'])} | 🌱 {age_text(data['age_sec'])}",
-        f"📍 CA: <code>{esc(short_addr(data['mint']))}</code>",
+        f"<code>{esc(data['mint'])}</code>",
         "",
-        f"💰 {money(data['price'])} ({pct(data['price_change_24h'])}) | MC: {mc_text}",
-        f"💧 LP: {money(data['liquidity'])} | Vol 24h: {money(data['volume24'])} | Vol/LP: {ratio_text(data['volume24'], data['liquidity'])}",
-        f"⏱️ 1H: {pct(data['price_change_1h'])} | Buys: {fmt_count(data['buys1h'])} | Sells: {fmt_count(data['sells1h'])}",
-        f"⚡ FDV: {money(data['fdv'])} | Supply: {token_supply_text(supply)} | Pools: {data.get('pool_count', 1)}",
+        f"💰 {money(data['price'])} | MC {mc_text}",
+        ath_line,
+        f"💧 LP {money(data['liquidity'])} | Vol 24h {money(data['volume24'])} | Vol/LP {ratio_text(data['volume24'], data['liquidity'])}",
+        f"📊 5m {pct(data.get('price_change_5m'))} | 1h {pct(data['price_change_1h'])} | 6h {pct(data.get('price_change_6h'))} | 24h {pct(data['price_change_24h'])}",
+        f"🔄 1h 🅑{fmt_count(data['buys1h'])} Ⓢ{fmt_count(data['sells1h'])} | 24h 🅑{fmt_count(data['buys24'])} Ⓢ{fmt_count(data['sells24'])} | Pools {data.get('pool_count', 1)}",
+    ]
+    if track_line:
+        lines.append(track_line)
+    lines += [
         "",
         f"🧠 {esc(narrative)}",
         "",
-        f"🔒 Mint: {mint_auth} | Freeze: {freeze_auth} | DEX Paid: {yes_no(data.get('dex_paid'))}",
-        f"👥 Holders: {holder_line}",
+        f"🔒 Mint: {authority_text('mint_authority_active')} | Freeze: {authority_text('freeze_authority_active')}",
+        f"💎 DEX Paid {yes_no(data.get('dex_paid'))} | Ads {yes_no(data.get('dex_ads'))}",
+        holders_line,
+        launch_block,
+        social_line,
+        "",
         f"⚠️ Risk: {esc(risk_text)}",
-        f"🎯 {verdict_text} - {esc(verdict_reason)}",
+        f"🎯 <b>{verdict_text}</b> - {esc(verdict_reason)}",
         BAR,
-        f"🔗 <a href=\"{esc(chart_url)}\">Chart</a> | <a href=\"{esc(dex_url)}\">DexScreener</a> | <a href=\"{esc(photon_url)}\">Photon</a> | <a href=\"{esc(solscan_url)}\">Solscan</a>",
         "<i>JABIR RUNNER | See Beyond The Chart.</i>",
     ]
     return "\n".join(lines)
 
 def report_keyboard(mint: str, pair_url: str, pair_address: Optional[str]) -> InlineKeyboardMarkup:
     pair_address = pair_address or mint
-    photon = f"https://photon-sol.tinyastro.io/en/lp/{pair_address}"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{mint}"), InlineKeyboardButton("📈 Chart", url=pair_url), InlineKeyboardButton("🛡️ Deep Scan", callback_data=f"deep:{mint}")],
-        [InlineKeyboardButton("DexScreener", url=pair_url), InlineKeyboardButton("Photon", url=photon), InlineKeyboardButton("Solscan", url=f"https://solscan.io/token/{mint}")],
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{mint}"),
+            InlineKeyboardButton("🛡️ Deep Scan", callback_data=f"deep:{mint}"),
+        ],
+        [
+            InlineKeyboardButton("📈 Chart", url=pair_url),
+            InlineKeyboardButton("Photon", url=f"https://photon-sol.tinyastro.io/en/lp/{pair_address}"),
+            InlineKeyboardButton("GMGN", url=f"https://gmgn.ai/sol/token/{mint}"),
+        ],
+        [
+            InlineKeyboardButton("Bubblemaps", url=f"https://app.bubblemaps.io/sol/token/{mint}"),
+            InlineKeyboardButton("RugCheck", url=f"https://rugcheck.xyz/tokens/{mint}"),
+            InlineKeyboardButton("Solscan", url=f"https://solscan.io/token/{mint}"),
+        ],
     ])
 
 # ------------------------------ TELEGRAM -------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
-        await update.message.reply_text("🚀 <b>JABIR RUNNER V3</b>\n<i>See Beyond The Chart.</i>\n\nTuro Solana token Contract Address (CA) domin scan.\nQuick tests: /testicles /pengu /grokius\nCommands: /help", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            "🚀 <b>JABIR RUNNER V3</b>\n<i>See Beyond The Chart.</i>\n\n"
+            "Send a Solana token address (CA) to scan it.\n"
+            "Quick tests: /testicles /pengu /grokius\nCommands: /help",
+            parse_mode=ParseMode.HTML,
+        )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
-        await update.message.reply_text("📖 <b>JABIR RUNNER V3 GUIDE</b>\n\n• Turo Solana CA domin scan.\n• /testicles, /pengu, /grokius domin gwaji.\n• Refresh yana sabunta market data.\n• Deep Scan yana neman holder data ta Helius.\n\nATH yana farawa daga lokacin tracking. Bundle/dev/sniper/fake-holder attribution bai gama ginawa ba. Helius da Groq suna buƙatar API keys nasu.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            "📖 <b>JABIR RUNNER V3 GUIDE</b>\n\n"
+            "• Send a Solana CA to scan it.\n"
+            "• /testicles, /pengu, /grokius are quick tests.\n"
+            "• Refresh updates the market data.\n"
+            "• Deep Scan adds total holder count and an ESTIMATE of launch bundles, snipers and dev wallet "
+            "(only works for tokens with a small transaction history).\n\n"
+            "Top holders exclude pool/program wallets. ATH comes from GeckoTerminal chart data. "
+            "Bundle/sniper/dev numbers are estimates, not proof.",
+            parse_mode=ParseMode.HTML,
+        )
 
-async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_message=None, chat_id: Optional[int] = None, deep: bool = False) -> None:
+async def perform_scan(
+    mint: str, context: ContextTypes.DEFAULT_TYPE,
+    status_message=None, chat_id: Optional[int] = None, deep: bool = False,
+    announce: bool = True,
+) -> None:
     async def notify(text: str) -> None:
+        """Send a plain error notice without ever raising."""
         try:
             if status_message:
                 await status_message.edit_text(text)
@@ -760,25 +1465,26 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
                 await context.bot.send_message(chat_id, text)
         except Exception:
             log.exception("Could not send scan notice")
+
     try:
-        if status_message:
-            await status_message.edit_text("🔍 JABIR RUNNER\n\n⏳ Fetching market data...")
+        if status_message and announce:
+            await status_message.edit_text("🔍 Scanning..." + (" (deep scan)" if deep else ""))
         data = await collect_token_data(mint, deep=deep)
-        if status_message:
-            await status_message.edit_text("🧠 Preparing trader report...")
         narrative = await groq_narrative(data)
         report = build_report(data, narrative, deep)
         keyboard = report_keyboard(mint, data["url"], data.get("pair"))
         if status_message:
-            await status_message.edit_text(report, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
+            await status_message.edit_text(
+                report, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
         elif chat_id is not None:
-            await context.bot.send_message(chat_id, report, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
+            await context.bot.send_message(
+                chat_id, report, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
     except ValueError as exc:
-        message = f"❌ {esc(exc)}"
-        if status_message:
-            await status_message.edit_text(message, parse_mode=ParseMode.HTML)
-        elif chat_id is not None:
-            await context.bot.send_message(chat_id, message, parse_mode=ParseMode.HTML)
+        await notify(f"❌ {exc}")
     except DexRateLimited as exc:
         log.warning("Scan for %s stopped by DexScreener rate limit: %s", mint, exc)
         await notify("⏳ DexScreener is rate-limiting requests right now. Please try again in about a minute.")
@@ -787,7 +1493,7 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
         await notify("❌ DexScreener is not responding properly right now. Please try again shortly.")
     except Exception:
         log.exception("Scan failed for %s", mint)
-        await notify("❌ Scan failed. Duba Render Logs da API keys/configuration.")
+        await notify("❌ Scan failed. Check the Render logs and API keys.")
 
 async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -801,13 +1507,13 @@ async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
     except Exception:
         pass
-    status = await message.reply_text("🔍 JABIR RUNNER\n\nAn karɓi CA. Ana fara scan...")
-    await perform_scan(mint, context, status_message=status, deep=False)
+    status = await message.reply_text("🔍 Scanning...")
+    await perform_scan(mint, context, status_message=status, deep=False, announce=False)
 
 async def preset_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
     if update.message:
-        status = await update.message.reply_text(f"🔍 Starting {key.upper()} scan...")
-        await perform_scan(TEST_TOKENS[key], context, status_message=status, deep=False)
+        status = await update.message.reply_text(f"🔍 Scanning {key.upper()}...")
+        await perform_scan(TEST_TOKENS[key], context, status_message=status, deep=False, announce=False)
 
 async def testicles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await preset_scan(update, context, "testicles")
@@ -836,7 +1542,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(application: Application) -> None:
     global _http
-    _http = httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=10.0), headers={"User-Agent": "JABIR-RUNNER/3.0"}, limits=httpx.Limits(max_connections=30, max_keepalive_connections=10))
+    _http = httpx.AsyncClient(
+        timeout=httpx.Timeout(25.0, connect=10.0),
+        headers={"User-Agent": "JABIR-RUNNER/3.0"},
+        limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),
+    )
     await asyncio.to_thread(init_db)
     log.info("JABIR RUNNER V3 initialized")
 
@@ -853,7 +1563,11 @@ def main() -> None:
         raise SystemExit("Missing RENDER_EXTERNAL_URL")
     if not WEBHOOK_SECRET:
         raise SystemExit("Missing WEBHOOK_SECRET")
-    app = (Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(post_init).post_shutdown(post_shutdown).build())
+
+    app = (
+        Application.builder().token(BOT_TOKEN).concurrent_updates(True)
+        .post_init(post_init).post_shutdown(post_shutdown).build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("testicles", testicles_cmd))
@@ -862,8 +1576,14 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ca))
     app.add_error_handler(error_handler)
+
     log.info("JABIR RUNNER V3 starting webhook")
-    app.run_webhook(listen="0.0.0.0", port=PORT, url_path=WEBHOOK_PATH, webhook_url=f"{RENDER_URL}/{WEBHOOK_PATH}", secret_token=WEBHOOK_SECRET, drop_pending_updates=True, bootstrap_retries=-1)
+    app.run_webhook(
+        listen="0.0.0.0", port=PORT, url_path=WEBHOOK_PATH,
+        webhook_url=f"{RENDER_URL}/{WEBHOOK_PATH}",
+        secret_token=WEBHOOK_SECRET, drop_pending_updates=True,
+        bootstrap_retries=-1,
+    )
 
 if __name__ == "__main__":
     main()
