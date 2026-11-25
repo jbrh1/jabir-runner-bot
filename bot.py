@@ -64,7 +64,6 @@ ATH_CACHE_TTL = 300
 ATH_FAIL_TTL = 60
 NARRATIVE_CACHE_TTL = 300
 
-# ---- FAST TIMEOUTS (scan should finish in ~5-8s) ----
 ATH_TIMEOUT = float(os.getenv("ATH_TIMEOUT", "3.0"))
 NARRATIVE_TIMEOUT = float(os.getenv("NARRATIVE_TIMEOUT", "3.5"))
 AUTHORITY_TIMEOUT = float(os.getenv("AUTHORITY_TIMEOUT", "3.0"))
@@ -1026,7 +1025,6 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
             log.warning("%s failed: %s", label, _scrub(str(exc)) or type(exc).__name__)
             return None
 
-    # 1) Fire the slowest independent task FIRST so it overlaps with everything else.
     pair_task = asyncio.create_task(fetch_pair(mint))
     supply_task = asyncio.create_task(fetch_supply(mint)) if HELIUS_KEY else None
     auth_task = asyncio.create_task(timed(fetch_authorities(mint), AUTHORITY_TIMEOUT, "authorities")) if HELIUS_KEY else None
@@ -1038,7 +1036,6 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
                 t.cancel()
         raise ValueError("No Solana pair found for this token address.")
 
-    # 2) Once we have the pair, fire ATH + paid status in parallel with supply/auth.
     price = safe_num(pair.get("priceUsd"))
     created_ms = safe_num(pair.get("pairCreatedAt"))
     age_sec = time.time() - created_ms / 1000 if created_ms else None
@@ -1050,11 +1047,9 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
         timed(fetch_paid_status(mint), PAID_TIMEOUT, "paid status")
     )
 
-    # 3) Collect supply + authorities (already running).
     supply = await supply_task if supply_task else None
     authorities = await auth_task if auth_task else None
 
-    # 4) Top holders needs supply (raw) — fire it now.
     top_task = None
     holders_task = None
     launch_task = None
@@ -1070,14 +1065,12 @@ async def collect_token_data(mint: str, deep: bool = False) -> dict[str, Any]:
                 timed(fetch_launch_buyers(mint, supply["raw"]), LAUNCH_TIMEOUT, "launch buyers")
             )
 
-    # 5) Await the results.
     ath_info = await ath_task
     paid = await paid_task
     top = await top_task if top_task else None
     holders = await holders_task if holders_task else None
     launch = await launch_task if launch_task else None
 
-    # 6) Build the result dict.
     base = pair.get("baseToken") or {}
     volume, changes = pair.get("volume") or {}, pair.get("priceChange") or {}
     txns = pair.get("txns") or {}
@@ -1177,6 +1170,9 @@ def market_flags(data: dict[str, Any]) -> list[tuple[str, str]]:
         flags.append(("MEDIUM", "24h volume is over 5x MC (possible wash trading)"))
     if vol is not None and data.get("fdv") and data["fdv"] > 0 and vol < data["fdv"] * 0.01:
         flags.append(("MEDIUM", "Very low volume compared to FDV"))
+    # NEW: Volume vs Liquidity wash-trading check
+    if vol is not None and liq is not None and liq > 0 and vol / liq > 5:
+        flags.append(("MEDIUM", f"Volume is {vol / liq:.1f}x liquidity (possible wash trading)"))
     ratio = buy_ratio(data)
     tx_total = (data.get("buys24") or 0) + (data.get("sells24") or 0)
     if ratio is not None and tx_total >= 100 and ratio < 0.40:
@@ -1217,6 +1213,7 @@ def verdict(data: dict[str, Any]) -> tuple[str, str]:
     liq, vol = data.get("liquidity"), data.get("volume24")
     mc = data.get("mc") or data.get("fdv")
     chg, age = data.get("price_change_24h"), data.get("age_sec")
+    chg1h = data.get("price_change_1h")
     flags = all_flags(data)
     if liq is not None and mc is not None and liq < 10_000 and mc > 100_000:
         return "🔴 AVOID", "Liquidity is too low for this market cap"
@@ -1236,10 +1233,11 @@ def verdict(data: dict[str, Any]) -> tuple[str, str]:
         return "🟡 WATCH", "Very new token with unusually high volume"
     if chg is not None and chg > 100 and liq is not None and vol is not None and vol > liq:
         return "🟡 WATCH", "Price is overheated. Wait for a pullback or confirmation"
+    # IMPROVED: use 1h change + lower ratio threshold
     ratio = buy_ratio(data)
-    if (chg is not None and chg > 0 and ratio is not None and ratio >= 0.55
+    if (chg1h is not None and chg1h > 0 and ratio is not None and ratio >= 0.45
             and liq is not None and liq >= 25_000 and age is not None and age >= 3600):
-        return "🟢 BUY", f"Up {chg:.1f}% in 24h, {ratio * 100:.0f}% buys, liquidity {money(liq)}"
+        return "🟢 BUY", f"Up {chg1h:.1f}% in 1h, {ratio * 100:.0f}% buys, liquidity {money(liq)}"
     return "🟡 WATCH", "No clear momentum yet"
 
 def fallback_narrative(data: dict[str, Any]) -> str:
@@ -1247,8 +1245,8 @@ def fallback_narrative(data: dict[str, Any]) -> str:
     links = [label for label, ok in (("X", socials.get("x")), ("website", socials.get("web")), ("Telegram", socials.get("tg"))) if ok]
     links_text = "has " + ", ".join(links) + " links" if links else "has no social links listed"
     return (
-        f"{data['name']} trades on {data['dex']}, is {age_text(data['age_sec'])} old and {links_text}. "
-        f"Project identity is unverified."
+        f"🤖 {data['name']} trades on {data['dex']}, is {age_text(data['age_sec'])} old and {links_text}. "
+        f"🔍 Project identity is unverified."
     )
 
 async def groq_narrative(data: dict[str, Any]) -> str:
@@ -1267,20 +1265,21 @@ async def groq_narrative(data: dict[str, Any]) -> str:
         "social_links_present": data["socials"],
     }
     prompt = (
-        "Write ONE short line in simple English (max 20 words) about this token for a trader. "
-        "Use only the data given. Say that the project identity is unverified. "
-        "Do not invent utility, team, news, partnerships, community or adoption. "
-        "Do not advise buying or selling. No quotes, no bullets, no intro. "
+        "Write ONE short fun line in simple English (max 25 words) about this token for a trader. "
+        "Use ONLY the data given. Say that the project identity is unverified. "
+        "Add 1-2 emojis that fit the mood (e.g. 🚀 rising, 🔥 hot, 💤 quiet, ⚠️ risky, 🐢 slow). "
+        "Do NOT invent utility, team, news, partnerships, community or adoption. "
+        "Do NOT advise buying or selling. No quotes, no bullets, no intro. "
         "Data: " + json.dumps(prompt_data, ensure_ascii=False)
     )
     try:
         payload: dict[str, Any] = {
             "model": GROQ_MODEL,
             "messages": [
-                {"role": "system", "content": "Return exactly one short line of simple English. No quotes."},
+                {"role": "system", "content": "Return exactly one short fun line of simple English with 1-2 emojis. No quotes."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.2,
+            "temperature": 0.3,
             "max_tokens": 800,
         }
         if "gpt-oss" in GROQ_MODEL.lower():
@@ -1451,7 +1450,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         candidates: dict[str, dict[str, Any]] = {}
 
-        # Fetch from multiple sources in parallel
         async def fetch_boosts() -> list:
             try:
                 latest = await dex_get_json(DEX_BOOSTS_LATEST_URL)
@@ -1477,7 +1475,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             fetch_boosts(), fetch_trending(), return_exceptions=True
         )
 
-        # Process boosted tokens (they have chainId and tokenAddress)
         if isinstance(boosts_items, list):
             for item in boosts_items:
                 if not isinstance(item, dict):
@@ -1489,7 +1486,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     continue
                 candidates.setdefault(token_addr, {"_needs_pair": True, "_boost_item": item})
 
-        # Process trending/search pairs directly
         if isinstance(trending_items, list):
             for item in trending_items:
                 if not isinstance(item, dict):
@@ -1506,7 +1502,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 elif not existing:
                     candidates[token_addr] = {"_pair_data": item}
 
-        # For boosted tokens without pair data, fetch pair info
         tokens_to_fetch = [
             mint for mint, data in candidates.items()
             if data.get("_needs_pair") and not data.get("_pair_data")
@@ -1520,7 +1515,6 @@ async def runners_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 except Exception:
                     pass
 
-        # Now filter and score
         results: list[dict[str, Any]] = []
         seen_mints: set[str] = set()
 
