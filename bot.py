@@ -87,6 +87,7 @@ log = logging.getLogger("jabir_runner")
 
 _http: Optional[httpx.AsyncClient] = None
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_missing_cache: dict[str, tuple[float, None]] = {}
 _holders_cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
 _narrative_cache: dict[str, tuple[float, str]] = {}
 _dex_semaphore: Optional[asyncio.Semaphore] = None
@@ -186,6 +187,22 @@ def is_on_curve(address: str) -> Optional[bool]:
     if x2 == 0: return sign_bit == 0
     return pow(x2, (_ED_P - 1) // 2, _ED_P) == 1
 
+# ------------------------------ MINT LOCK (Restored) -------------------------
+@asynccontextmanager
+async def mint_lock(key: str) -> AsyncIterator[None]:
+    entry = _mint_locks.get(key)
+    if entry is None:
+        entry = _LockEntry()
+        _mint_locks[key] = entry
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0 and _mint_locks.get(key) is entry:
+            del _mint_locks[key]
+
 # ------------------------------ DATABASE -------------------------------------
 def db_connect() -> sqlite3.Connection:
     db = sqlite3.connect(DB_PATH, timeout=20)
@@ -205,6 +222,8 @@ def db_session():
         db.close()
 
 def init_db() -> None:
+    folder = os.path.dirname(DB_PATH)
+    if folder: os.makedirs(folder, exist_ok=True)
     with db_session() as db:
         db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, scans INTEGER DEFAULT 0)")
 
