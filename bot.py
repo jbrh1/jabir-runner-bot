@@ -175,6 +175,13 @@ def pct(value: Optional[float]) -> str:
     return "N/A" if value is None else f"{value:+.1f}%"
 
 
+def pct_or_zero(value: Optional[float]) -> str:
+    """Fix #3: Never show N/A for price changes, default to +0.0%"""
+    if value is None:
+        return "+0.0%"
+    return f"{value:+.1f}%"
+
+
 def age_text(seconds: Optional[float]) -> str:
     if seconds is None:
         return "N/A"
@@ -416,6 +423,20 @@ async def dex_get_json(url: str, max_attempts: int = 3) -> Any:
         raise DexRateLimited("DexScreener rate limited")
 
 
+async def fetch_with_retry(url: str, max_retries: int = 3) -> Any:
+    """Fix #2: Fetches JSON from DexScreener with 3 retries."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await dex_get_json(url)
+        except Exception as e:
+            log.warning(f"DexScreener attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(2.0)
+            else:
+                log.error(f"DexScreener completely failed after {max_retries} attempts.")
+                return None
+
+
 async def helius_rpc(method: str, params: Any) -> Any:
     if not HELIUS_KEY:
         return None
@@ -461,7 +482,12 @@ async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
         cached = _cached_pair(mint)
         if cached:
             return cached
-        payload = await dex_get_json(DEX_TOKEN_URL.format(mint))
+        
+        # Fix #2: Use fetch_with_retry instead of dex_get_json
+        payload = await fetch_with_retry(DEX_TOKEN_URL.format(mint))
+        if not payload:
+            return None
+            
         combined = pick_pair(payload.get("pairs") if isinstance(payload, dict) else [], mint)
         if not combined:
             _missing_cache[mint] = (time.time(), None)
@@ -667,9 +693,12 @@ async def fetch_launch_data(mint: str, supply_raw: int) -> Optional[dict[str, An
 
 
 def socials_from_pair(pair: dict[str, Any]) -> dict[str, Any]:
+    """Fix #1: Pull socials directly from DexScreener metadata."""
     info = pair.get("info") or {}
+    
     websites = [x.get("url") for x in (info.get("websites") or []) if isinstance(x, dict) and x.get("url")]
     socials = [x for x in (info.get("socials") or []) if isinstance(x, dict)]
+    
     x_url, tg_url = None, None
     for s in socials:
         p = str(s.get("platform", "")).lower()
@@ -678,7 +707,12 @@ def socials_from_pair(pair: dict[str, Any]) -> dict[str, Any]:
             x_url = u
         elif p in ("telegram", "tg"):
             tg_url = u
-    return {"x": x_url, "web": websites[0] if websites else None, "tg": tg_url}
+
+    return {
+        "x": x_url, 
+        "web": websites[0] if websites else None, 
+        "tg": tg_url
+    }
 
 
 # ------------------------------ VERDICT --------------------------------------
@@ -802,7 +836,6 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
     else:
         dev_line = f"👨‍💻 Dev: 🟢 Holds {dev_pct:.1f}% now"
 
-    # Fixed Creator Line
     if creator_info.get("error") or not creator_info.get("checked"):
         creator_line = "🏭 Creator: ⚠️ Unknown - Could not verify"
     elif creator_info.get("rugs", 0) > 0:
@@ -816,7 +849,8 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
         f"<code>{esc(data['mint'])}</code>\n",
         f"💰 {money(data['price'])} | MC {money(data.get('mc') or data.get('fdv'))}",
         f"💧 LP {money(data['liquidity'])} | Vol 24h {money(data['volume24'])} | Vol/LP {ratio_text(data['volume24'], data['liquidity'])}",
-        f"📊 5m {pct(data.get('price_change_5m'))} | 1h {pct(data['price_change_1h'])} | 6h {pct(data.get('price_change_6h'))} | 24h {pct(data['price_change_24h'])}",
+        # Fix #3: Use pct_or_zero for 5m
+        f"📊 5m {pct_or_zero(data.get('price_change_5m'))} | 1h {pct(data['price_change_1h'])} | 6h {pct(data.get('price_change_6h'))} | 24h {pct(data['price_change_24h'])}",
         f"🔄 1h 🅑{fmt_count(data['buys1h'])} Ⓢ{fmt_count(data['sells1h'])} | 24h 🅑{fmt_count(data['buys24'])} Ⓢ{fmt_count(data['sells24'])}\n",
         auth_line,
         f"👥 Top 10: {top10_text} | Holders: {holders_text}\n",
@@ -869,8 +903,8 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
 async def run_runners(message: Any) -> None:
     status = await message.reply_text("🚀 Finding top Solana runners...")
     try:
-        latest = await dex_get_json(DEX_BOOSTS_LATEST_URL)
-        top = await dex_get_json(DEX_BOOSTS_TOP_URL)
+        latest = await fetch_with_retry(DEX_BOOSTS_LATEST_URL)
+        top = await fetch_with_retry(DEX_BOOSTS_TOP_URL)
         items = (latest if isinstance(latest, list) else []) + (top if isinstance(top, list) else [])
         mints: list[str] = []
         for item in items:
@@ -883,7 +917,10 @@ async def run_runners(message: Any) -> None:
         if not mints:
             return await safe_edit(status, "No runners found right now. Market is slow.")
 
-        payload = await dex_get_json(DEX_TOKEN_URL.format(",".join(mints)))
+        payload = await fetch_with_retry(DEX_TOKEN_URL.format(",".join(mints)))
+        if not payload:
+            return await safe_edit(status, "DexScreener is busy. Try again shortly.")
+            
         all_pairs = payload.get("pairs") if isinstance(payload, dict) else []
         results = []
         for mint in mints:
@@ -1044,7 +1081,6 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
                 return None
             return await guarded(fetch_dev_balance(mint, creator), HELIUS_MISC_TIMEOUT, "dev balance")
 
-        # REMOVED `if deep` - Now runs on EVERY scan
         async def creator_task() -> dict[str, Any]:
             if not creator:
                 return {"checked": False, "error": True}
