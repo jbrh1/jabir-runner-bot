@@ -555,20 +555,20 @@ async def fetch_dev_balance(mint: str, creator: str) -> Optional[int]:
 
 
 async def fetch_creator_history(creator: str, current_mint: str) -> dict[str, Any]:
-    """Heuristic: other tokens this wallet recently created that look dead."""
+    """Checks the creator's last 5 tokens for rugs. Runs on EVERY scan."""
     if not creator or not HELIUS_KEY:
-        return {"checked": False, "rugs": 0, "launches": 0}
+        return {"checked": False, "rugs": 0, "launches": 0, "error": True}
     try:
         sigs = await helius_rpc("getSignaturesForAddress", [creator, {"limit": 20, "commitment": "confirmed"}])
         if not isinstance(sigs, list):
-            return {"checked": False, "rugs": 0, "launches": 0}
+            return {"checked": False, "rugs": 0, "launches": 0, "error": True}
+            
         limiter = asyncio.Semaphore(6)
-
         async def load(sig: str) -> Any:
             async with limiter:
                 try:
                     return await helius_rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
-                except Exception:  # noqa: BLE001
+                except Exception:
                     return None
 
         txs = await asyncio.gather(*(load(s["signature"]) for s in sigs if isinstance(s, dict) and s.get("signature") and not s.get("err")))
@@ -583,16 +583,17 @@ async def fetch_creator_history(creator: str, current_mint: str) -> dict[str, An
                 m = b.get("mint") if isinstance(b, dict) else None
                 if m and m != current_mint and m not in other_mints:
                     other_mints.append(m)
-        other_mints = other_mints[:5]
+                    
+        other_mints = other_mints[:5] # Only check last 5
         rugs = 0
         for m in other_mints:
             try:
                 payload = await dex_get_json(DEX_TOKEN_URL.format(m))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 continue
             pairs = [p for p in (payload.get("pairs") or []) if isinstance(p, dict) and nested(p, "baseToken", "address") == m] if isinstance(payload, dict) else []
             if not pairs:
-                continue  # unlisted != rug
+                continue
             best = max(pairs, key=lambda p: safe_num(nested(p, "liquidity", "usd")) or 0)
             liq = safe_num(nested(best, "liquidity", "usd")) or 0
             change = safe_num(nested(best, "priceChange", "h24")) or 0
@@ -600,10 +601,11 @@ async def fetch_creator_history(creator: str, current_mint: str) -> dict[str, An
             old_enough = created is not None and (time.time() - created / 1000) > 3600
             if (liq < 300 and old_enough) or change < -90:
                 rugs += 1
-        return {"checked": True, "rugs": rugs, "launches": len(other_mints)}
-    except Exception as e:  # noqa: BLE001
+                
+        return {"checked": True, "rugs": rugs, "launches": len(other_mints), "error": False}
+    except Exception as e:
         log.warning("creator history failed: %s", e)
-        return {"checked": False, "rugs": 0, "launches": 0}
+        return {"checked": False, "rugs": 0, "launches": 0, "error": True}
 
 
 async def fetch_launch_data(mint: str, supply_raw: int) -> Optional[dict[str, Any]]:
@@ -684,8 +686,13 @@ def get_verdict(data: dict[str, Any]) -> tuple[str, str]:
     score = 0
     reasons: list[str] = []
     creator_info = data.get("creator_info") or {}
+    
     if creator_info.get("checked") and creator_info.get("rugs", 0) > 0:
         return "⛔ HIGH RISK", f"Creator has {creator_info['rugs']} suspected dead launch(es)"
+    
+    if not creator_info.get("checked"):
+        score += 15
+        reasons.append("Creator could not be verified")
 
     auth = data.get("authorities")
     if auth is None:
@@ -744,10 +751,15 @@ async def generate_narrative(data: dict[str, Any]) -> str:
         f"Name: {_clean_for_prompt(data['name'])} | Symbol: {_clean_for_prompt(data['symbol'], 12)}\n"
         f"Age: {age_text(data.get('age_sec'))}. Liquidity: ${data.get('liquidity') or 0:,.0f}. "
         f"Dev holdings: {'unknown' if data.get('dev_pct') is None else 'known'}.\n"
-        "Use 1-2 emojis. Be brief. No financial advice."
+        "Use 1-2 emojis. Be brief. No financial advice. Ensure the sentence is complete."
     )
     try:
-        payload = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 120}
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 400
+        }
         res = await asyncio.wait_for(request_json("POST", GROQ_URL, headers={"Authorization": f"Bearer {GROQ_KEY}"}, json=payload), NARRATIVE_TIMEOUT)
         text = res["choices"][0]["message"]["content"].strip()
         _narrative_cache[data["mint"]] = (time.time(), text)
@@ -790,8 +802,9 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
     else:
         dev_line = f"👨‍💻 Dev: 🟢 Holds {dev_pct:.1f}% now"
 
-    if not creator_info.get("checked"):
-        creator_line = "🏭 Creator: not checked (use 🛡️ Deep Scan)"
+    # Fixed Creator Line
+    if creator_info.get("error") or not creator_info.get("checked"):
+        creator_line = "🏭 Creator: ⚠️ Unknown - Could not verify"
     elif creator_info.get("rugs", 0) > 0:
         creator_line = f"🏭 Creator: 🔴 {creator_info['rugs']} suspected dead launch(es) of {creator_info.get('launches', 0)} checked"
     else:
@@ -1031,11 +1044,12 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
                 return None
             return await guarded(fetch_dev_balance(mint, creator), HELIUS_MISC_TIMEOUT, "dev balance")
 
+        # REMOVED `if deep` - Now runs on EVERY scan
         async def creator_task() -> dict[str, Any]:
-            if not (deep and creator):
-                return {"checked": False}
+            if not creator:
+                return {"checked": False, "error": True}
             res = await guarded(fetch_creator_history(creator, mint), CREATOR_TIMEOUT, "creator history")
-            return res or {"checked": False}
+            return res or {"checked": False, "error": True}
 
         dev_balance, creator_info, narrative = await asyncio.gather(dev_task(), creator_task(), generate_narrative(data))
         if dev_balance is not None and supply and supply["raw"]:
