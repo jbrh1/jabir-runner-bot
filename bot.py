@@ -60,11 +60,12 @@ CACHE_TTL = int(os.getenv("CACHE_TTL", "60"))
 HOLDERS_CACHE_TTL = 120
 NARRATIVE_CACHE_TTL = 300
 MISSING_CACHE_TTL = 30
+CREATOR_CACHE_TTL = 600
 
-NARRATIVE_TIMEOUT = float(os.getenv("NARRATIVE_TIMEOUT", "6.0"))
+NARRATIVE_TIMEOUT = float(os.getenv("NARRATIVE_TIMEOUT", "10.0"))
 TOP_HOLDERS_TIMEOUT = float(os.getenv("TOP_HOLDERS_TIMEOUT", "6.0"))
-LAUNCH_TIMEOUT = float(os.getenv("LAUNCH_TIMEOUT", "20.0"))
-CREATOR_TIMEOUT = float(os.getenv("CREATOR_TIMEOUT", "25.0"))
+LAUNCH_TIMEOUT = float(os.getenv("LAUNCH_TIMEOUT", "25.0"))
+CREATOR_TIMEOUT = float(os.getenv("CREATOR_TIMEOUT", "30.0"))
 HELIUS_MISC_TIMEOUT = 10.0
 
 CACHE_MAX = 500
@@ -73,6 +74,9 @@ HOLDER_PAGE_SIZE = 1000
 LAUNCH_SIG_PAGES = 6
 LAUNCH_TX_SAMPLE = 40
 SNIPER_SLOTS = 3
+
+RUNNER_CHUNK = 5          # DexScreener returns ~30 pairs per request, so batch small
+RUNNER_MAX_MINTS = 25
 
 ALERT_INTERVAL = int(os.getenv("ALERT_INTERVAL", "60"))
 MAX_ALERTS_PER_USER = 10
@@ -93,6 +97,7 @@ _cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _missing_cache: dict[str, tuple[float, None]] = {}
 _holders_cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
 _narrative_cache: dict[str, tuple[float, str]] = {}
+_creator_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _dex_semaphore: Optional[asyncio.Semaphore] = None
 _dex_last_request: float = -1e9
 
@@ -176,7 +181,7 @@ def pct(value: Optional[float]) -> str:
 
 
 def pct_or_zero(value: Optional[float]) -> str:
-    """Fix #3: Never show N/A for price changes, default to +0.0%"""
+    """Never show N/A for short-term price changes, default to +0.0%."""
     if value is None:
         return "+0.0%"
     return f"{value:+.1f}%"
@@ -398,43 +403,47 @@ def _get_dex_semaphore() -> asyncio.Semaphore:
 
 
 async def dex_get_json(url: str, max_attempts: int = 3) -> Any:
+    """
+    The ONLY place DexScreener retries happen.
+    Retries network errors, 429 and 5xx. Other 4xx fail immediately.
+    Raises DexScreenerError (or DexRateLimited) when all attempts fail.
+    """
     global _dex_last_request
     if _http is None:
         raise RuntimeError("HTTP client is not initialized")
     async with _get_dex_semaphore():
+        last_error = "unknown error"
+        rate_limited = False
         for attempt in range(1, max_attempts + 1):
             gap = DEX_MIN_INTERVAL - (time.monotonic() - _dex_last_request)
             if gap > 0:
                 await asyncio.sleep(gap)
+            retryable = False
             try:
                 response = await _http.get(url, timeout=20.0)
                 _dex_last_request = time.monotonic()
-                if response.status_code == 429:
-                    await asyncio.sleep(2.0 * attempt)
-                    continue
-                if response.status_code >= 400:
-                    raise DexScreenerError(f"HTTP {response.status_code}")
-                return response.json()
-            except Exception as e:  # noqa: BLE001
+                status = response.status_code
+                if status == 429:
+                    rate_limited, retryable, last_error = True, True, "HTTP 429"
+                elif status >= 500:
+                    retryable, last_error = True, f"HTTP {status}"
+                elif status >= 400:
+                    raise DexScreenerError(f"HTTP {status}")
+                else:
+                    try:
+                        return response.json()
+                    except ValueError as e:
+                        raise DexScreenerError("invalid JSON from DexScreener") from e
+            except DexScreenerError:
+                raise
+            except httpx.HTTPError as e:
                 _dex_last_request = time.monotonic()
-                if attempt == max_attempts:
-                    raise DexScreenerError(str(e)) from e
+                retryable, last_error = True, str(e) or e.__class__.__name__
+            if retryable and attempt < max_attempts:
                 await asyncio.sleep(2.0 * attempt)
-        raise DexRateLimited("DexScreener rate limited")
-
-
-async def fetch_with_retry(url: str, max_retries: int = 3) -> Any:
-    """Fix #2: Fetches JSON from DexScreener with 3 retries."""
-    for attempt in range(1, max_retries + 1):
-        try:
-            return await dex_get_json(url)
-        except Exception as e:
-            log.warning(f"DexScreener attempt {attempt}/{max_retries} failed: {e}")
-            if attempt < max_retries:
-                await asyncio.sleep(2.0)
-            else:
-                log.error(f"DexScreener completely failed after {max_retries} attempts.")
-                return None
+        if rate_limited:
+            raise DexRateLimited("DexScreener rate limited")
+        raise DexScreenerError(last_error)
 
 
 async def helius_rpc(method: str, params: Any) -> Any:
@@ -473,6 +482,10 @@ def _is_missing(mint: str) -> bool:
 
 
 async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
+    """
+    Returns the pair, or None if the token genuinely isn't listed.
+    Raises DexScreenerError if DexScreener itself is failing (so callers can say "busy").
+    """
     cached = _cached_pair(mint)
     if cached:
         return cached
@@ -482,12 +495,7 @@ async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
         cached = _cached_pair(mint)
         if cached:
             return cached
-        
-        # Fix #2: Use fetch_with_retry instead of dex_get_json
-        payload = await fetch_with_retry(DEX_TOKEN_URL.format(mint))
-        if not payload:
-            return None
-            
+        payload = await dex_get_json(DEX_TOKEN_URL.format(mint))
         combined = pick_pair(payload.get("pairs") if isinstance(payload, dict) else [], mint)
         if not combined:
             _missing_cache[mint] = (time.time(), None)
@@ -581,20 +589,27 @@ async def fetch_dev_balance(mint: str, creator: str) -> Optional[int]:
 
 
 async def fetch_creator_history(creator: str, current_mint: str) -> dict[str, Any]:
-    """Checks the creator's last 5 tokens for rugs. Runs on EVERY scan."""
+    """Checks the creator's recent tokens for dead launches. Deep Scan only. Cached per creator."""
     if not creator or not HELIUS_KEY:
         return {"checked": False, "rugs": 0, "launches": 0, "error": True}
+
+    cache_key = f"{creator}:{current_mint}"
+    cached = _creator_cache.get(cache_key)
+    if cached and time.time() - cached[0] < CREATOR_CACHE_TTL:
+        return cached[1]
+
     try:
         sigs = await helius_rpc("getSignaturesForAddress", [creator, {"limit": 20, "commitment": "confirmed"}])
         if not isinstance(sigs, list):
             return {"checked": False, "rugs": 0, "launches": 0, "error": True}
-            
+
         limiter = asyncio.Semaphore(6)
+
         async def load(sig: str) -> Any:
             async with limiter:
                 try:
                     return await helius_rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
-                except Exception:
+                except Exception:  # noqa: BLE001
                     return None
 
         txs = await asyncio.gather(*(load(s["signature"]) for s in sigs if isinstance(s, dict) and s.get("signature") and not s.get("err")))
@@ -609,17 +624,19 @@ async def fetch_creator_history(creator: str, current_mint: str) -> dict[str, An
                 m = b.get("mint") if isinstance(b, dict) else None
                 if m and m != current_mint and m not in other_mints:
                     other_mints.append(m)
-                    
-        other_mints = other_mints[:5] # Only check last 5
+
+        other_mints = other_mints[:5]
         rugs = 0
+        checked_any = 0
         for m in other_mints:
             try:
                 payload = await dex_get_json(DEX_TOKEN_URL.format(m))
-            except Exception:
+            except DexScreenerError:
                 continue
             pairs = [p for p in (payload.get("pairs") or []) if isinstance(p, dict) and nested(p, "baseToken", "address") == m] if isinstance(payload, dict) else []
             if not pairs:
                 continue
+            checked_any += 1
             best = max(pairs, key=lambda p: safe_num(nested(p, "liquidity", "usd")) or 0)
             liq = safe_num(nested(best, "liquidity", "usd")) or 0
             change = safe_num(nested(best, "priceChange", "h24")) or 0
@@ -627,9 +644,12 @@ async def fetch_creator_history(creator: str, current_mint: str) -> dict[str, An
             old_enough = created is not None and (time.time() - created / 1000) > 3600
             if (liq < 300 and old_enough) or change < -90:
                 rugs += 1
-                
-        return {"checked": True, "rugs": rugs, "launches": len(other_mints), "error": False}
-    except Exception as e:
+
+        result = {"checked": True, "rugs": rugs, "launches": len(other_mints), "error": False}
+        _creator_cache[cache_key] = (time.time(), result)
+        _trim(_creator_cache, CREATOR_CACHE_TTL)
+        return result
+    except Exception as e:  # noqa: BLE001
         log.warning("creator history failed: %s", e)
         return {"checked": False, "rugs": 0, "launches": 0, "error": True}
 
@@ -643,8 +663,11 @@ async def fetch_launch_data(mint: str, supply_raw: int) -> Optional[dict[str, An
         if before:
             opts["before"] = before
         page = await helius_rpc("getSignaturesForAddress", [mint, opts])
-        if not isinstance(page, list) or not page:
-            reached_start = True if signatures or page == [] else False
+        if not isinstance(page, list):
+            # RPC error / no key: we can't trust a partial history, so history is unknown.
+            return None
+        if not page:
+            reached_start = True
             break
         signatures.extend(s for s in page if isinstance(s, dict) and s.get("signature"))
         if len(page) < 1000:
@@ -666,9 +689,11 @@ async def fetch_launch_data(mint: str, supply_raw: int) -> Optional[dict[str, An
             return await helius_rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
 
     results = await asyncio.gather(*(load(s["signature"]) for s in oldest), return_exceptions=True)
-    txs = [r for r in results if isinstance(r, dict)]
-    if not txs:
+
+    # The very first transaction defines launch slot + creator. If it failed to load, don't guess.
+    if not isinstance(results[0], dict):
         return None
+    txs = [r for r in results if isinstance(r, dict)]
 
     launch_slot = safe_int(txs[0].get("slot"))
     first_key = nested(txs[0], "transaction", "message", "accountKeys", 0)
@@ -693,12 +718,12 @@ async def fetch_launch_data(mint: str, supply_raw: int) -> Optional[dict[str, An
 
 
 def socials_from_pair(pair: dict[str, Any]) -> dict[str, Any]:
-    """Fix #1: Pull socials directly from DexScreener metadata."""
+    """Pull socials directly from DexScreener metadata."""
     info = pair.get("info") or {}
-    
+
     websites = [x.get("url") for x in (info.get("websites") or []) if isinstance(x, dict) and x.get("url")]
     socials = [x for x in (info.get("socials") or []) if isinstance(x, dict)]
-    
+
     x_url, tg_url = None, None
     for s in socials:
         p = str(s.get("platform", "")).lower()
@@ -708,11 +733,7 @@ def socials_from_pair(pair: dict[str, Any]) -> dict[str, Any]:
         elif p in ("telegram", "tg"):
             tg_url = u
 
-    return {
-        "x": x_url, 
-        "web": websites[0] if websites else None, 
-        "tg": tg_url
-    }
+    return {"x": x_url, "web": websites[0] if websites else None, "tg": tg_url}
 
 
 # ------------------------------ VERDICT --------------------------------------
@@ -720,13 +741,19 @@ def get_verdict(data: dict[str, Any]) -> tuple[str, str]:
     score = 0
     reasons: list[str] = []
     creator_info = data.get("creator_info") or {}
-    
-    if creator_info.get("checked") and creator_info.get("rugs", 0) > 0:
-        return "⛔ HIGH RISK", f"Creator has {creator_info['rugs']} suspected dead launch(es)"
-    
-    if not creator_info.get("checked"):
+
+    if creator_info.get("skipped"):
+        pass  # normal scan: creator history not run, don't penalize
+    elif not creator_info.get("checked"):
         score += 15
         reasons.append("Creator could not be verified")
+    else:
+        rugs = creator_info.get("rugs", 0)
+        if rugs >= 2:
+            return "⛔ HIGH RISK", f"Creator has {rugs} suspected dead launches"
+        if rugs == 1:
+            score += 35
+            reasons.append("Creator has 1 suspected dead launch")
 
     auth = data.get("authorities")
     if auth is None:
@@ -788,18 +815,29 @@ async def generate_narrative(data: dict[str, Any]) -> str:
         "Use 1-2 emojis. Be brief. No financial advice. Ensure the sentence is complete."
     )
     try:
-        payload = {
+        payload: dict[str, Any] = {
             "model": GROQ_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
-            "max_tokens": 400
+            "max_tokens": 1000,
         }
-        res = await asyncio.wait_for(request_json("POST", GROQ_URL, headers={"Authorization": f"Bearer {GROQ_KEY}"}, json=payload), NARRATIVE_TIMEOUT)
-        text = res["choices"][0]["message"]["content"].strip()
+        # Reasoning models (gpt-oss) can burn the whole token budget on hidden reasoning
+        # and return empty content. Keep reasoning minimal.
+        if "gpt-oss" in GROQ_MODEL.lower():
+            payload["reasoning_effort"] = "low"
+        res = await asyncio.wait_for(
+            request_json("POST", GROQ_URL, headers={"Authorization": f"Bearer {GROQ_KEY}"}, json=payload),
+            NARRATIVE_TIMEOUT,
+        )
+        text = (nested(res, "choices", 0, "message", "content") or "").strip()
+        if not text:
+            log.warning("narrative: model returned empty content")
+            return "The AI had nothing to say. Check the risks above."
         _narrative_cache[data["mint"]] = (time.time(), text)
         _trim(_narrative_cache, NARRATIVE_CACHE_TTL)
         return text
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.warning("narrative failed: %s", e)
         return "The AI is resting. Check the risks above."
 
 
@@ -836,20 +874,22 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
     else:
         dev_line = f"👨‍💻 Dev: 🟢 Holds {dev_pct:.1f}% now"
 
-    if creator_info.get("error") or not creator_info.get("checked"):
+    if creator_info.get("skipped"):
+        creator_line = "🏭 Creator: ⏭️ Not checked - tap 🛡️ Deep Scan"
+    elif creator_info.get("error") or not creator_info.get("checked"):
         creator_line = "🏭 Creator: ⚠️ Unknown - Could not verify"
     elif creator_info.get("rugs", 0) > 0:
         creator_line = f"🏭 Creator: 🔴 {creator_info['rugs']} suspected dead launch(es) of {creator_info.get('launches', 0)} checked"
     else:
         creator_line = f"🏭 Creator: ✅ No dead launches in {creator_info.get('launches', 0)} recent checked"
 
+    tag = " | 🛡️ DEEP" if deep else ""
     lines = [
-        f"🚀 <b>JABIR RUNNER V3</b> | ${esc(data['symbol'])}",
+        f"🚀 <b>JABIR RUNNER V3</b> | ${esc(data['symbol'])}{tag}",
         f"🪙 {esc(data['name'])} | {esc(data['dex'])} | 🌱 {age_text(data['age_sec'])}",
         f"<code>{esc(data['mint'])}</code>\n",
         f"💰 {money(data['price'])} | MC {money(data.get('mc') or data.get('fdv'))}",
         f"💧 LP {money(data['liquidity'])} | Vol 24h {money(data['volume24'])} | Vol/LP {ratio_text(data['volume24'], data['liquidity'])}",
-        # Fix #3: Use pct_or_zero for 5m
         f"📊 5m {pct_or_zero(data.get('price_change_5m'))} | 1h {pct(data['price_change_1h'])} | 6h {pct(data.get('price_change_6h'))} | 24h {pct(data['price_change_24h'])}",
         f"🔄 1h 🅑{fmt_count(data['buys1h'])} Ⓢ{fmt_count(data['sells1h'])} | 24h 🅑{fmt_count(data['buys24'])} Ⓢ{fmt_count(data['sells24'])}\n",
         auth_line,
@@ -857,11 +897,10 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
         creator_line,
         dev_line,
     ]
-    if deep:
-        if launch and not launch.get("limit_reached") and "sniper_count" in launch:
-            lines.append(f"📦 Early buyers (first {SNIPER_SLOTS} slots): {launch['sniper_count']} wallets, {launch['sniper_pct']:.1f}% of supply")
-        else:
-            lines.append("📦 Early buyers: unknown")
+    if launch and not launch.get("limit_reached") and "sniper_count" in launch:
+        lines.append(f"📦 Early buyers (first {SNIPER_SLOTS} slots): {launch['sniper_count']} wallets, {launch['sniper_pct']:.1f}% of supply")
+    else:
+        lines.append("📦 Early buyers: unknown")
 
     lines += [
         f"\n🧠 <i>{esc(narrative)}</i>\n",
@@ -882,10 +921,13 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
 
     chart_links = []
     dex_url = data.get("url") or (f"https://dexscreener.com/solana/{data['pair']}" if data.get("pair") else None)
-    if link("DEXScreener", dex_url):
-        chart_links.append(link("DEXScreener", dex_url))
+    dex_link = link("DEXScreener", dex_url)
+    if dex_link:
+        chart_links.append(dex_link)
     if data.get("pair"):
-        chart_links.append(link("DEXTools", f"https://www.dextools.io/app/en/solana/pair-explorer/{data['pair']}"))
+        dt_link = link("DEXTools", f"https://www.dextools.io/app/en/solana/pair-explorer/{data['pair']}")
+        if dt_link:
+            chart_links.append(dt_link)
     if chart_links:
         lines.append("📊 Chart: " + " • ".join(chart_links))
 
@@ -900,11 +942,22 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
 
 
 # ------------------------------ RUNNERS --------------------------------------
+async def _try_dex_json(url: str) -> Any:
+    try:
+        return await dex_get_json(url)
+    except DexScreenerError as e:
+        log.warning("DexScreener request failed: %s", e)
+        return None
+
+
 async def run_runners(message: Any) -> None:
     status = await message.reply_text("🚀 Finding top Solana runners...")
     try:
-        latest = await fetch_with_retry(DEX_BOOSTS_LATEST_URL)
-        top = await fetch_with_retry(DEX_BOOSTS_TOP_URL)
+        latest = await _try_dex_json(DEX_BOOSTS_LATEST_URL)
+        top = await _try_dex_json(DEX_BOOSTS_TOP_URL)
+        if latest is None and top is None:
+            return await safe_edit(status, "DexScreener is busy. Try again shortly.")
+
         items = (latest if isinstance(latest, list) else []) + (top if isinstance(top, list) else [])
         mints: list[str] = []
         for item in items:
@@ -913,28 +966,41 @@ async def run_runners(message: Any) -> None:
             addr = item.get("tokenAddress")
             if addr and SOL_ADDR_RE.fullmatch(addr) and addr not in mints:
                 mints.append(addr)
-        mints = mints[:30]
+        mints = mints[:RUNNER_MAX_MINTS]
         if not mints:
             return await safe_edit(status, "No runners found right now. Market is slow.")
 
-        payload = await fetch_with_retry(DEX_TOKEN_URL.format(",".join(mints)))
-        if not payload:
-            return await safe_edit(status, "DexScreener is busy. Try again shortly.")
-            
-        all_pairs = payload.get("pairs") if isinstance(payload, dict) else []
+        # DexScreener returns ~30 pairs TOTAL per request, so fetch in small chunks
+        # or later tokens come back empty.
         results = []
-        for mint in mints:
-            pair = pick_pair(all_pairs, mint)
-            if not pair:
+        any_chunk_ok = False
+        for i in range(0, len(mints), RUNNER_CHUNK):
+            chunk = mints[i:i + RUNNER_CHUNK]
+            payload = await _try_dex_json(DEX_TOKEN_URL.format(",".join(chunk)))
+            if not payload:
                 continue
-            _cache[mint] = (time.time(), pair)
-            mc = safe_num(pair.get("marketCap")) or safe_num(pair.get("fdv")) or 0
-            liq = safe_num(nested(pair, "liquidity", "usd")) or 0
-            vol = safe_num(nested(pair, "volume", "h24")) or 0
-            chg = safe_num(nested(pair, "priceChange", "h24")) or 0
-            if mc > 100_000 and liq > 5_000 and vol > 10_000 and chg > 5:
-                results.append({"mint": mint, "symbol": nested(pair, "baseToken", "symbol") or "?", "chg": chg, "mc": mc, "liq": liq, "vol": vol, "url": f"https://dexscreener.com/solana/{mint}"})
+            any_chunk_ok = True
+            all_pairs = payload.get("pairs") if isinstance(payload, dict) else []
+            for mint in chunk:
+                pair = pick_pair(all_pairs, mint)
+                if not pair:
+                    continue
+                _cache[mint] = (time.time(), pair)
+                mc = safe_num(pair.get("marketCap")) or safe_num(pair.get("fdv")) or 0
+                liq = safe_num(nested(pair, "liquidity", "usd")) or 0
+                vol = safe_num(nested(pair, "volume", "h24")) or 0
+                chg = safe_num(nested(pair, "priceChange", "h24")) or 0
+                if mc > 100_000 and liq > 5_000 and vol > 10_000 and chg > 5:
+                    results.append({
+                        "mint": mint,
+                        "symbol": nested(pair, "baseToken", "symbol") or "?",
+                        "chg": chg, "mc": mc, "liq": liq, "vol": vol,
+                        "url": pair.get("url") or f"https://dexscreener.com/solana/{pair.get('pairAddress') or mint}",
+                    })
         _trim(_cache, CACHE_TTL)
+
+        if not any_chunk_ok:
+            return await safe_edit(status, "DexScreener is busy. Try again shortly.")
 
         results.sort(key=lambda x: x["vol"], reverse=True)
         ranked = results[:10]
@@ -944,9 +1010,9 @@ async def run_runners(message: Any) -> None:
         lines = ["🚀 <b>TOP RUNNERS</b>\n"]
         buttons = []
         for i, r in enumerate(ranked, 1):
-            lines.append(f"<b>#{i} ${esc(r['symbol'])}</b> <b>{pct(r['chg'])}</b>\nMC {money(r['mc'])} | LP {money(r['liq'])} | Vol {money(r['vol'])}")
+            lines.append(f"<b>#{i} ${esc(r['symbol'])}</b> <b>{pct(r['chg'])}</b>\nMC {money(r['mc'])} | LP {money(r['liq'])} | Vol {money(r['vol'])}\n<code>{esc(r['mint'])}</code>")
             if i <= 5:
-                buttons.append([InlineKeyboardButton(f"📈 #{i} ${r['symbol'][:16]} Chart", url=r["url"])])
+                buttons.append([InlineKeyboardButton(f"📈 #{i} ${str(r['symbol'])[:16]} Chart", url=r["url"])])
         await safe_edit(status, "\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
     except Exception:
         log.exception("runners failed")
@@ -977,10 +1043,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
             "📖 <b>GUIDE</b>\n\n• Send a Solana CA to scan.\n"
-            "• <code>/alert CA 0.001 above</code> (or <code>below</code>)\n"
+            "• <code>/alert CA 0.001 above</code> (or <code>below</code>). Alerts fire once, then are removed.\n"
             "• /alerts lists your alerts, <code>/delalert ID</code> removes one, /clearalerts removes all.\n"
             "• /runners lists top trending tokens.\n"
-            "• 🛡️ Deep Scan adds creator history and early-buyer (sniper) detection.\n\n"
+            "• 🛡️ Deep Scan adds the creator's launch history check.\n\n"
             "<i>Heuristic risk checks only. Not financial advice.</i>",
             parse_mode=ParseMode.HTML,
         )
@@ -1000,17 +1066,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "btn_how":
         await query.message.reply_text(
             "❓ <b>HOW IT WORKS</b>\n\n🔒 <b>Mint:</b> Dev can print infinite tokens.\n❄️ <b>Freeze:</b> Dev can freeze your wallet.\n"
-            "🏭 <b>Creator:</b> Looks at the creator wallet's other recent launches (Deep Scan).\n👨‍💻 <b>Dev:</b> What the creator wallet holds right now.\n"
-            "📦 <b>Early buyers:</b> Wallets that received tokens within the first few slots (Deep Scan).",
+            "👨‍💻 <b>Dev:</b> What the creator wallet holds right now.\n"
+            "📦 <b>Early buyers:</b> Wallets that received tokens within the first few slots.\n"
+            "🏭 <b>Creator:</b> Looks at the creator wallet's other recent launches (Deep Scan only).",
             parse_mode=ParseMode.HTML,
         )
     elif ":" in data:
         action, mint = data.split(":", 1)
-        if action in ("refresh", "deep", "scan") and SOL_ADDR_RE.fullmatch(mint):
+        if action in ("refresh", "refreshd", "deep", "scan") and SOL_ADDR_RE.fullmatch(mint):
             user = query.from_user
             if user:
                 await asyncio.to_thread(record_user, user.id, user.username, user.first_name)
-            ok = await perform_scan(mint, context, status_message=query.message, deep=(action == "deep"), force=(action == "refresh"))
+            ok = await perform_scan(
+                mint, context, status_message=query.message,
+                deep=(action in ("deep", "refreshd")),
+                force=(action in ("refresh", "refreshd")),
+            )
             if ok and user:
                 await asyncio.to_thread(record_scan, user.id)
 
@@ -1029,6 +1100,7 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
             _cache.pop(mint, None)
             _missing_cache.pop(mint, None)
             _holders_cache.pop(mint, None)
+            _narrative_cache.pop(mint, None)
         if status_message and deep:
             await safe_edit(status_message, "🔍 Deep Scanning...")
 
@@ -1065,7 +1137,7 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
             "buys1h": safe_int(nested(txns, "h1", "buys")), "sells1h": safe_int(nested(txns, "h1", "sells")),
             "buys24": safe_int(nested(txns, "h24", "buys")), "sells24": safe_int(nested(txns, "h24", "sells")),
             "age_sec": (time.time() - created_ms / 1000) if created_ms else None,
-            "authorities": auth, "launch_data": launch_data, "creator_info": {"checked": False},
+            "authorities": auth, "launch_data": launch_data, "creator_info": {"checked": False, "skipped": True},
             "socials": socials_from_pair(pair), "holders_count": holders_count,
             "dev_pct": None,
         }
@@ -1082,6 +1154,9 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
             return await guarded(fetch_dev_balance(mint, creator), HELIUS_MISC_TIMEOUT, "dev balance")
 
         async def creator_task() -> dict[str, Any]:
+            # Expensive (~20 getTransaction calls + DexScreener lookups): Deep Scan only.
+            if not deep:
+                return {"checked": False, "skipped": True}
             if not creator:
                 return {"checked": False, "error": True}
             res = await guarded(fetch_creator_history(creator, mint), CREATOR_TIMEOUT, "creator history")
@@ -1093,8 +1168,9 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
         data["creator_info"] = creator_info
 
         report = build_report(data, narrative, deep)
+        refresh_cb = f"refreshd:{mint}" if deep else f"refresh:{mint}"
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{mint}"), InlineKeyboardButton("🛡️ Deep Scan", callback_data=f"deep:{mint}")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data=refresh_cb), InlineKeyboardButton("🛡️ Deep Scan", callback_data=f"deep:{mint}")],
             [InlineKeyboardButton("Photon", url=f"https://photon-sol.tinyastro.io/en/lp/{mint}"), InlineKeyboardButton("GMGN", url=f"https://gmgn.ai/sol/token/{mint}"), InlineKeyboardButton("Bubblemaps", url=f"https://app.bubblemaps.io/sol/token/{mint}")],
         ])
         if status_message:
@@ -1149,7 +1225,7 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if alert_id is None:
         return await message.reply_text(f"You already have {MAX_ALERTS_PER_USER} alerts. Remove one with /delalert ID.")
     await message.reply_text(
-        f"✅ Alert #{alert_id}: ${esc(symbol)} {direction} {money(target)}\nCurrent price: {money(safe_num(pair.get('priceUsd')))}",
+        f"✅ Alert #{alert_id}: ${esc(symbol)} {direction} {money(target)}\nCurrent price: {money(safe_num(pair.get('priceUsd')))}\n<i>One-time alert: it is removed after it triggers.</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1193,7 +1269,8 @@ async def alert_loop(application: Application) -> None:
             by_mint: dict[str, list[dict[str, Any]]] = {}
             for a in alerts:
                 by_mint.setdefault(a["mint"], []).append(a)
-            for mint, items in list(by_mint.items())[:40]:
+            # No hard slice: every mint gets checked each cycle (DexScreener limiter paces requests).
+            for mint, items in by_mint.items():
                 try:
                     pair = await fetch_pair(mint)
                 except DexScreenerError:
@@ -1211,7 +1288,7 @@ async def alert_loop(application: Application) -> None:
                             f"🔔 <b>ALERT</b> ${esc(a['symbol'])} is {a['direction']} {money(a['target'])}\nPrice now: {money(price)}\n<code>{esc(mint)}</code>",
                             parse_mode=ParseMode.HTML,
                         )
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         log.warning("alert delivery failed for #%s", a["id"])
                     await asyncio.to_thread(alert_delete_id, a["id"])
             await asyncio.sleep(ALERT_INTERVAL)
@@ -1243,7 +1320,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ------------------------------ MAIN -----------------------------------------
 async def post_init(application: Application) -> None:
     global _http
-    _http = httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "JABIR-RUNNER/4.0"})
+    _http = httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "JABIR-RUNNER/3.0"})
     await asyncio.to_thread(init_db)
     application.bot_data["alert_task"] = asyncio.create_task(alert_loop(application))
 
