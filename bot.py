@@ -119,6 +119,7 @@ _narrative_cache: dict[str, tuple[float, str]] = {}
 _creator_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _dex_semaphore: Optional[asyncio.Semaphore] = None
 _dex_last_request: float = -1e9
+_dex_blocked_until: float = 0.0
 
 
 class DexScreenerError(RuntimeError):
@@ -448,10 +449,13 @@ def _get_dex_semaphore() -> asyncio.Semaphore:
 
 
 async def dex_get_json(url: str, max_attempts: int = 3) -> Any:
-    global _dex_last_request
+    global _dex_last_request, _dex_blocked_until
     if _http is None:
         raise RuntimeError("HTTP client is not initialized")
     async with _get_dex_semaphore():
+        remaining = _dex_blocked_until - time.monotonic()
+        if remaining > 0:
+            raise DexRateLimited(f"DexScreener cooldown, {remaining:.0f}s left")
         last_error = "unknown error"
         rate_limited = False
         for attempt in range(1, max_attempts + 1):
@@ -467,7 +471,12 @@ async def dex_get_json(url: str, max_attempts: int = 3) -> Any:
                 if status == 429:
                     rate_limited, retryable, last_error = True, True, "HTTP 429"
                     retry_after = safe_num(response.headers.get("Retry-After"))
-                    wait = min(max(retry_after, 1.0), 10.0) if retry_after else 3.0 * attempt
+                    if retry_after and retry_after > 10.0:
+                        # Server asked for a long pause. Sleeping here would freeze every user,
+                        # so fail fast and refuse new DexScreener calls until the pause is over.
+                        _dex_blocked_until = time.monotonic() + min(retry_after, 120.0)
+                        raise DexRateLimited(f"DexScreener asked to wait {retry_after:.0f}s")
+                    wait = max(retry_after, 1.0) if retry_after else 3.0 * attempt
                 elif status >= 500:
                     retryable, last_error = True, f"HTTP {status}"
                 elif status >= 400:
@@ -485,6 +494,7 @@ async def dex_get_json(url: str, max_attempts: int = 3) -> Any:
             if retryable and attempt < max_attempts:
                 await asyncio.sleep(wait)
         if rate_limited:
+            _dex_blocked_until = time.monotonic() + 10.0
             raise DexRateLimited("DexScreener rate limited")
         raise DexScreenerError(last_error)
 
@@ -689,6 +699,7 @@ async def fetch_creator_wallet(mint: str) -> Optional[str]:
                     address = creator.get("address")
                     if isinstance(address, str) and is_valid_solana_address(address):
                         return address
+        log.info("no verified metadata creator for %s (getAsset creators=%s)", mint, creators)
     except Exception as e:
         log.warning("DAS metadata creator fetch failed: %s", e)
     return None
