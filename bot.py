@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Optional
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters,
@@ -79,6 +79,7 @@ HOLDERS_CACHE_TTL = 120
 NARRATIVE_CACHE_TTL = 300
 MISSING_CACHE_TTL = 30
 CREATOR_CACHE_TTL = 600
+STALE_PAIR_MAX_AGE = 600
 
 NARRATIVE_TIMEOUT = _env_float("NARRATIVE_TIMEOUT", 10.0, minimum=1.0)
 TOP_HOLDERS_TIMEOUT = _env_float("TOP_HOLDERS_TIMEOUT", 6.0, minimum=1.0)
@@ -458,12 +459,15 @@ async def dex_get_json(url: str, max_attempts: int = 3) -> Any:
             if gap > 0:
                 await asyncio.sleep(gap)
             retryable = False
+            wait = 2.0 * attempt
             try:
                 response = await _http.get(url, timeout=20.0)
                 _dex_last_request = time.monotonic()
                 status = response.status_code
                 if status == 429:
                     rate_limited, retryable, last_error = True, True, "HTTP 429"
+                    retry_after = safe_num(response.headers.get("Retry-After"))
+                    wait = min(max(retry_after, 1.0), 10.0) if retry_after else 3.0 * attempt
                 elif status >= 500:
                     retryable, last_error = True, f"HTTP {status}"
                 elif status >= 400:
@@ -479,7 +483,7 @@ async def dex_get_json(url: str, max_attempts: int = 3) -> Any:
                 _dex_last_request = time.monotonic()
                 retryable, last_error = True, str(e) or e.__class__.__name__
             if retryable and attempt < max_attempts:
-                await asyncio.sleep(2.0 * attempt)
+                await asyncio.sleep(wait)
         if rate_limited:
             raise DexRateLimited("DexScreener rate limited")
         raise DexScreenerError(last_error)
@@ -552,7 +556,14 @@ async def fetch_pair(mint: str) -> Optional[dict[str, Any]]:
 
         # DexScreener is the source of market data. Jupiter metadata must never
         # be converted into a synthetic pair with invented zero liquidity/volume.
-        payload = await dex_get_json(DEX_TOKEN_URL.format(mint))
+        try:
+            payload = await dex_get_json(DEX_TOKEN_URL.format(mint))
+        except DexScreenerError as e:
+            stale = _cache.get(mint)
+            if stale and time.time() - stale[0] < STALE_PAIR_MAX_AGE:
+                log.warning("DexScreener failed (%s); serving stale pair for %s", e, mint)
+                return {**stale[1], "_stale_age": time.time() - stale[0]}
+            raise
         if not isinstance(payload, dict):
             raise DexScreenerError("Invalid DexScreener response shape")
 
@@ -671,7 +682,7 @@ async def fetch_creator_wallet(mint: str) -> Optional[str]:
         return None
     try:
         result = await helius_rpc("getAsset", {"id": mint})
-        creators = nested(result, "content", "metadata", "creators") or []
+        creators = nested(result, "creators") or nested(result, "content", "metadata", "creators") or []
         if isinstance(creators, list):
             for creator in creators:
                 if isinstance(creator, dict) and creator.get("verified"):
@@ -807,9 +818,10 @@ async def fetch_launch_data(mint: str, supply_raw: int) -> Optional[dict[str, An
         *(load(item["signature"]) for item in oldest),
         return_exceptions=True,
     )
-    txs = [result for result in results if isinstance(result, dict)]
-    if not txs:
+    # The oldest tx defines the launch slot. If it failed to load, do not guess.
+    if not results or not isinstance(results[0], dict):
         return None
+    txs = [result for result in results if isinstance(result, dict)]
 
     launch_slot = safe_int(txs[0].get("slot"))
     # These are early token recipients, not verified sniper buys.
@@ -1004,9 +1016,7 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
         holders_text = f"{hc[0]:,}{'+' if hc[1] else ''}"
 
     dev_pct = data.get("dev_pct")
-    if launch.get("limit_reached"):
-        dev_line = "👨‍💻 Metadata creator holdings: ⚠️ UNKNOWN - launch wallet not verified"
-    elif dev_pct is None:
+    if dev_pct is None:
         dev_line = "👨‍💻 Metadata creator holdings: ❔ unknown"
     elif dev_pct > 10:
         dev_line = f"👨‍💻 Metadata creator wallet: 🔴 Holds {dev_pct:.1f}% now"
@@ -1044,10 +1054,12 @@ def build_report(data: dict[str, Any], narrative: str, deep: bool) -> str:
         creator_line,
         dev_line,
     ]
+    if data.get("stale_age"):
+        lines.insert(3, f"⏱️ <i>DexScreener busy - market data is {age_text(data['stale_age'])} old</i>")
     if launch and not launch.get("limit_reached") and "early_recipient_count" in launch and launch.get("early_recipient_pct") is not None:
         lines.append(f"📦 Early recipients (first {SNIPER_SLOTS} slots): {launch['early_recipient_count']} wallets, {launch['early_recipient_pct']:.1f}% of supply")
     else:
-        lines.append("📦 Early recipients: unknown")
+        lines.append("📦 Early recipients: n/a - token too old/busy to trace" if launch.get("limit_reached") else "📦 Early recipients: unknown")
 
     lines += [
         f"\n🧠 <i>{esc(narrative)}</i>\n",
@@ -1270,13 +1282,19 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
             guarded(fetch_holder_count(mint), LAUNCH_TIMEOUT, "holder count"),
         )
 
-        creator = await guarded(fetch_creator_wallet(mint), HELIUS_MISC_TIMEOUT, "creator wallet")
-        
-        launch_data = None
-        if not creator and supply:
-            launch_data = await guarded(fetch_launch_data(mint, supply["raw"]), LAUNCH_TIMEOUT, "launch data")
-            # Launch transaction fee payer is not proof of the token creator.
-            # Do not substitute it for a verified metadata creator.
+        _created = safe_num(pair.get("pairCreatedAt"))
+        _tx24 = (safe_int(nested(pair, "txns", "h24", "buys")) or 0) + (safe_int(nested(pair, "txns", "h24", "sells")) or 0)
+        # History reads are capped at LAUNCH_SIG_PAGES * 1000 signatures; older/busier tokens can never reach the launch.
+        skip_launch = (_created is not None and time.time() - _created / 1000 > 2 * 86400) or _tx24 > 3000
+
+        async def _no_launch() -> Optional[dict[str, Any]]:
+            return {"limit_reached": True} if skip_launch else None
+
+        creator, launch_data = await asyncio.gather(
+            guarded(fetch_creator_wallet(mint), HELIUS_MISC_TIMEOUT, "creator wallet"),
+            guarded(fetch_launch_data(mint, supply["raw"]), LAUNCH_TIMEOUT, "launch data") if (supply and not skip_launch) else _no_launch(),
+        )
+        # Launch fee payer is not proof of the token creator, so it is never used as the creator.
 
         base = pair.get("baseToken") or {}
         txns = pair.get("txns") or {}
@@ -1296,6 +1314,7 @@ async def perform_scan(mint: str, context: ContextTypes.DEFAULT_TYPE, status_mes
             "age_sec": (time.time() - created_ms / 1000) if created_ms else None,
             "authorities": auth, "launch_data": launch_data, "creator_info": {"checked": False, "skipped": True},
             "socials": socials_from_pair(pair), "holders_count": holders_count,
+            "stale_age": pair.get("_stale_age"),
             "dev_pct": None,
         }
 
@@ -1446,6 +1465,8 @@ async def alert_loop(application: Application) -> None:
                     pair = await fetch_pair(mint)
                 except DexScreenerError:
                     continue
+                if pair and pair.get("_stale_age"):
+                    continue
                 price = safe_num(pair.get("priceUsd")) if pair else None
                 if price is None:
                     continue
@@ -1459,6 +1480,9 @@ async def alert_loop(application: Application) -> None:
                             f"🔔 <b>ALERT</b> ${esc(a['symbol'])} is {a['direction']} {money(a['target'])}\nPrice now: {money(price)}\n<code>{esc(mint)}</code>",
                             parse_mode=ParseMode.HTML,
                         )
+                    except Forbidden:
+                        log.warning("alert #%s: bot blocked by chat; removing", a["id"])
+                        await asyncio.to_thread(alert_delete_id, a["id"])
                     except Exception:
                         log.exception("alert delivery failed for #%s; keeping it for retry", a["id"])
                     else:
